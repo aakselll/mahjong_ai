@@ -53,8 +53,10 @@ N_ROUNDS_CTX = 8
 SCORE_NORM = 20.0
 RECENCY_DECAY = 0.85
 RECENCY_WINDOW = 12
-ORACLE_DIM = 4 * 34 - 34 + 34  # mains des 3 adversaires + mur cache
-
+# --- Vecteur oracle a plat (pour _pending_oracle initialisation) ---
+ORACLE_FLAT_DIM = 4 * 34       # 136 : 3 mains + mur, aplati
+# --- Canaux oracle pour l'agent RL (4 canaux de 34) ---
+ORACLE_DIM = 4
 
 def _get_env_float(name, default):
     try:
@@ -85,14 +87,18 @@ _MELD_TYPE_MAP = {
     "kan_open": Meld.KAN,
 }
 
-
 class MultiAgentMahjongEnv:
-    def __init__(self, seed=None):
+    def __init__(self, seed=None, frozen_sl_models=None, compute_lookahead=True):
         self.rng = np.random.RandomState(seed)
+        # [RL] modeles SL figes pour riichi/chow/pong/kong.
+        # Si None, ces tetes yield une request comme avant.
+        # Si dict {'riichi': model, ...}, le modele SL decide directement.
+        self.frozen_sl = frozen_sl_models
         self._gen = None
         self.hands = None
         self.melds = None
         self.discards = None
+        self._compute_lookahead = compute_lookahead
         self.wall = None
         self.rinshan_pool = None
         self.dora_indicators = None
@@ -109,7 +115,7 @@ class MultiAgentMahjongEnv:
         self._safe_after_riichi = [np.zeros(N_TILES, dtype=np.float32) for _ in range(4)]
         self._any_call = False
         self._last_discarder = None
-        self._pending_oracle = np.zeros(ORACLE_DIM, dtype=np.float32)
+        self._pending_oracle = np.zeros((ORACLE_DIM, N_TILES), dtype=np.float32)
         self.ctx = {"round_wind_idx": 0, "round_idx": 0, "scores": [0.0] * 4}
         self._stats = self._new_stats()
 
@@ -143,10 +149,11 @@ class MultiAgentMahjongEnv:
                 self._stats["yaku_counts"][y.name] = \
                     self._stats["yaku_counts"].get(y.name, 0) + 1
 
-    def set_game_context(self, round_wind_idx, round_idx, scores):
+    def set_game_context(self, round_wind_idx, round_idx, scores, honba=0):
         self.ctx = {"round_wind_idx": int(round_wind_idx),
                     "round_idx": int(round_idx),
-                    "scores": [float(x) for x in scores]}
+                    "scores": [float(x) for x in scores],
+                    "honba": int(honba)}
 
     def reset_round(self):
         while True:
@@ -157,11 +164,22 @@ class MultiAgentMahjongEnv:
                 continue
             return first["next_request"]
 
+    # def step(self, action):
+    #     try:
+    #         return self._gen.send(action)
+    #     except StopIteration as e:
+    #         return e.value
+
+
     def step(self, action):
         try:
-            return self._gen.send(action)
+            result = self._gen.send(action)
         except StopIteration as e:
-            return e.value
+            result = e.value
+        # [pMCPA] Stocke le reward pour les rollouts
+        if result.get('round_done'):
+            self._last_round_rewards = result.get('final_rewards', {})
+        return result
 
     @property
     def obs_dim(self):
@@ -223,6 +241,35 @@ class MultiAgentMahjongEnv:
             self.dora_indicators.append(ind)
             self.ura_dora_indicators.append(ura)
             self._next_dora_pair_idx += 1
+
+    def _should_declare_ron(self, seat, win_result):
+        """Regle rule-based Suphx §2.1 pour declarer RON.
+
+        Not last round -> toujours declarer.
+        Last round -> declarer sauf si ca nous laisse dernier apres le gain.
+        """
+        scores = list(self.ctx.get("scores", [0.0] * 4))
+        round_idx = int(self.ctx.get("round_idx", 0))
+        n_rounds = 4   # East 1-4
+
+        # Pas la derniere manche : declarer
+        if round_idx < n_rounds - 1:
+            return True
+
+        # Derniere manche : verifier le classement apres RON
+        cost = win_result.cost
+        if isinstance(cost, dict):
+            gain = cost.get("total", 0) / 1000.0
+        else:
+            gain = cost / 1000.0
+
+        new_scores = scores.copy()
+        new_scores[seat] += gain
+
+        # Si apres le gain on reste dernier, ne pas declarer
+        if new_scores[seat] <= min(new_scores):
+            return False
+        return True
 
     def _draw_replacement(self):
         if not self.rinshan_pool:
@@ -531,12 +578,22 @@ class MultiAgentMahjongEnv:
         return np.clip(COPIES_PER_TILE - seen, 0, COPIES_PER_TILE)
 
     def _build_oracle(self, seat):
-        opp_hands = [self.hands[o].astype(np.float32) for o in self._others(seat)]
+        """Retourne l'obs oracle (ORACLE_DIM=4, 34) :
+            - canal 0 : main adversaire 1 (normalise /4)
+            - canal 1 : main adversaire 2
+            - canal 2 : main adversaire 3
+            - canal 3 : mur cache (normalise /4)
+        Conforme a Suphx §3.3 : l'oracle voit les mains adverses + le mur.
+        """
+        opps = self._others(seat)
+        opp_hands = [self.hands[o].astype(np.float32) / COPIES_PER_TILE
+                     for o in opps]
         unseen = self._unseen_counts(seat).astype(np.float32)
-        hidden_wall = np.clip(unseen - sum(opp_hands), 0, COPIES_PER_TILE)
-        return np.concatenate(
-            [h / COPIES_PER_TILE for h in opp_hands] + [hidden_wall / COPIES_PER_TILE]
-        ).astype(np.float32)
+        hidden_wall = np.clip(
+            unseen - sum(self.hands[o] for o in opps),
+            0, COPIES_PER_TILE
+        ) / COPIES_PER_TILE
+        return np.stack(opp_hands + [hidden_wall], axis=0)  # (4, 34)
 
     def _build_obs(self, seat, pending_claim_tile=None):
         """Retourne (N_CHANNELS, 34) float32 via envs.suphx_features."""
@@ -550,6 +607,7 @@ class MultiAgentMahjongEnv:
             discards=self.discards,
             discard_hist=self._discard_hist,
             riichi_flags=self.riichi,
+            compute_lookahead_flag=self._compute_lookahead,
             furiten_flag=self._is_furiten(seat),
             dora_indicators=self.dora_indicators,
             wall_remaining=len(self.wall),
@@ -557,7 +615,7 @@ class MultiAgentMahjongEnv:
             dealer_seat=0,
             round_wind=round_wind,
             round_id=round_id,
-            honba=0,
+            honba=int(self.ctx.get("honba", 0)),
             kyoutaku=self.riichi_deposits,
             seat=seat,
             pending_claim_tile=pending_claim_tile,
@@ -566,6 +624,28 @@ class MultiAgentMahjongEnv:
         self._pending_oracle = self._build_oracle(seat)
         return obs
 
+    def _sl_decide(self, seat, head, mask, pending_claim_tile=None):
+        """Appelle le modele SL fige pour cette tete.
+
+        Retourne l'action (int) ou None si pas de modele fige pour cette
+        tete (fallback : yield dans _round_flow).
+        """
+        if self.frozen_sl is None or head not in self.frozen_sl:
+            return None
+        try:
+            import torch
+            obs = self._build_obs(seat, pending_claim_tile=pending_claim_tile)
+            obs_t = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
+            model = self.frozen_sl[head]
+            with torch.no_grad():
+                logits = model(obs_t)[0].numpy()
+            masked = logits * mask
+            if masked.sum() == 0:
+                return None
+            return int(masked.argmax())
+        except Exception:
+            return None
+        
     @staticmethod
     def _zero_rewards():
         return {s: 0.0 for s in range(4)}
@@ -680,10 +760,15 @@ class MultiAgentMahjongEnv:
                                         else None))
 
                     if kong_tile is not None and self.rinshan_pool:
-                        obs_k = self._build_obs(seat)
                         mask_k = np.array([1.0, 1.0], dtype=np.float32)
-                        request = self._request(seat, KONG, obs_k, mask_k)
-                        kong_action = yield self._combine(pending[0], pending[1], request)
+                        # [RL] Decide par SL fige si disponible
+                        kong_action = self._sl_decide(seat, 'kong', mask_k,
+                                                       pending_claim_tile=None)
+                        if kong_action is None:
+                            obs_k = self._build_obs(seat)
+                            request = self._request(seat, KONG, obs_k, mask_k)
+                            kong_action = yield self._combine(pending[0], pending[1], request)
+
 
                         if kong_action == KONG_YES:
                             if kong_kind == "closed":
@@ -719,35 +804,28 @@ class MultiAgentMahjongEnv:
                                     chankan_ronners = {}
                                     prev_pending = pending
                                     for o in list(chankan_candidates.keys()):
-                                        obs_r = self._build_obs(o, pending_claim_tile=kong_tile)
-                                        mask_r = np.array([1.0, 1.0], dtype=np.float32)
-                                        req_r = self._request(o, RON, obs_r, mask_r)
-                                        ron_action = yield self._combine(
-                                            prev_pending[0], prev_pending[1], req_r)
-                                        if ron_action == RON_YES:
-                                            chankan_ronners[o] = chankan_candidates[o]
-                                            prev_pending = (0.0, o)
+                                        if self.frozen_sl is not None:
+                                            # [FIX] RL : rule-based
+                                            if self._should_declare_ron(o, chankan_candidates[o]):
+                                                chankan_ronners[o] = chankan_candidates[o]
+                                                prev_pending = (0.0, o)
+                                            else:
+                                                self._furiten_temp[o] = True
+                                                self._stats["ron_refused"] += 1
+                                                prev_pending = (-RON_REFUSE_PENALTY, o)
                                         else:
-                                            self._furiten_temp[o] = True
-                                            self._stats["ron_refused"] += 1
-                                            prev_pending = (-RON_REFUSE_PENALTY, o)
-                                    if chankan_ronners:
-                                        if len(chankan_ronners) > 1:
-                                            self._stats["multi_ron"] += 1
-                                        else:
-                                            self._stats["ron"] += 1
-                                        final_rewards = self._zero_rewards()
-                                        for k_o, (o, res) in enumerate(chankan_ronners.items()):
-                                            payment = self._distribute_win_payment(
-                                                o, seat, res, give_kyoutaku=(k_o == 0))
-                                            self._record_win_yaku(o, res)
-                                            for s in range(4):
-                                                final_rewards[s] += payment[s]
-                                        outcome = ("multi_ron" if len(chankan_ronners) > 1
-                                                    else "ron")
-                                        return self._final(prev_pending[0], prev_pending[1],
-                                                            final_rewards, outcome)
-                                    pending = prev_pending
+                                            obs_r = self._build_obs(o, pending_claim_tile=kong_tile)
+                                            mask_r = np.array([1.0, 1.0], dtype=np.float32)
+                                            req_r = self._request(o, RON, obs_r, mask_r)
+                                            ron_action = yield self._combine(
+                                                prev_pending[0], prev_pending[1], req_r)
+                                            if ron_action == RON_YES:
+                                                chankan_ronners[o] = chankan_candidates[o]
+                                                prev_pending = (0.0, o)
+                                            else:
+                                                self._furiten_temp[o] = True
+                                                self._stats["ron_refused"] += 1
+                                                prev_pending = (-RON_REFUSE_PENALTY, o)
 
                             abort = self._check_abortive_draw()
                             if abort:
@@ -767,10 +845,14 @@ class MultiAgentMahjongEnv:
 
                 riichi_options = self._can_declare_riichi(seat)
                 if riichi_options is not None:
-                    obs_r = self._build_obs(seat)
                     mask_r = np.array([1.0, 1.0], dtype=np.float32)
-                    request = self._request(seat, RIICHI, obs_r, mask_r)
-                    riichi_action = yield self._combine(pending[0], pending[1], request)
+                    # [RL] Decide par SL fige si disponible
+                    riichi_action = self._sl_decide(seat, 'riichi', mask_r,
+                                                     pending_claim_tile=None)
+                    if riichi_action is None:
+                        obs_r = self._build_obs(seat)
+                        request = self._request(seat, RIICHI, obs_r, mask_r)
+                        riichi_action = yield self._combine(pending[0], pending[1], request)
 
                     if riichi_action == RIICHI_YES:
                         self._stats["riichi"] += 1
@@ -854,17 +936,28 @@ class MultiAgentMahjongEnv:
                 ronners = {}
                 prev_pending = pending
                 for o in list(ron_candidates.keys()):
-                    obs_ron = self._build_obs(o, pending_claim_tile=discarded_tile)
-                    mask_ron = np.array([1.0, 1.0], dtype=np.float32)
-                    request = self._request(o, RON, obs_ron, mask_ron)
-                    ron_action = yield self._combine(prev_pending[0], prev_pending[1], request)
-                    if ron_action == RON_YES:
-                        ronners[o] = ron_candidates[o]
-                        prev_pending = (0.0, o)
+                    # [FIX] RL : decide en interne via regle rule-based,
+                    # sinon yield (SL/entrainement manuel).
+                    if self.frozen_sl is not None:
+                        if self._should_declare_ron(o, ron_candidates[o]):
+                            ronners[o] = ron_candidates[o]
+                            prev_pending = (0.0, o)
+                        else:
+                            self._furiten_temp[o] = True
+                            self._stats["ron_refused"] += 1
+                            prev_pending = (-RON_REFUSE_PENALTY, o)
                     else:
-                        self._furiten_temp[o] = True
-                        self._stats["ron_refused"] += 1
-                        prev_pending = (-RON_REFUSE_PENALTY, o)
+                        obs_ron = self._build_obs(o, pending_claim_tile=discarded_tile)
+                        mask_ron = np.array([1.0, 1.0], dtype=np.float32)
+                        request = self._request(o, RON, obs_ron, mask_ron)
+                        ron_action = yield self._combine(prev_pending[0], prev_pending[1], request)
+                        if ron_action == RON_YES:
+                            ronners[o] = ron_candidates[o]
+                            prev_pending = (0.0, o)
+                        else:
+                            self._furiten_temp[o] = True
+                            self._stats["ron_refused"] += 1
+                            prev_pending = (-RON_REFUSE_PENALTY, o)
 
                 if ronners:
                     if len(ronners) > 1:
@@ -883,16 +976,22 @@ class MultiAgentMahjongEnv:
                                         final_rewards, outcome)
                 pending = prev_pending
 
+                
             # Daiminkan
             daiminkan_seat = next(
                 (o for o in self._others(discarder)
                  if not self.riichi[o] and self.hands[o][discarded_tile] >= 3), None)
             claimed = False
             if daiminkan_seat is not None and self.rinshan_pool:
-                obs_k = self._build_obs(daiminkan_seat, pending_claim_tile=discarded_tile)
                 mask_k = np.array([1.0, 1.0], dtype=np.float32)
-                request = self._request(daiminkan_seat, KONG, obs_k, mask_k)
-                kong_action = yield self._combine(pending[0], pending[1], request)
+                # [RL] Decide par SL fige si disponible
+                kong_action = self._sl_decide(daiminkan_seat, 'kong', mask_k,
+                                               pending_claim_tile=discarded_tile)
+                if kong_action is None:
+                    obs_k = self._build_obs(daiminkan_seat,
+                                             pending_claim_tile=discarded_tile)
+                    request = self._request(daiminkan_seat, KONG, obs_k, mask_k)
+                    kong_action = yield self._combine(pending[0], pending[1], request)
 
                 if kong_action == KONG_YES:
                     self._stats["daiminkan"] += 1
@@ -934,10 +1033,14 @@ class MultiAgentMahjongEnv:
                      if not self.riichi[o] and not self.force_closed[o]
                      and self.hands[o][discarded_tile] >= 2), None)
                 if pong_seat is not None:
-                    obs_p = self._build_obs(pong_seat, pending_claim_tile=discarded_tile)
                     mask_p = np.array([1.0, 1.0], dtype=np.float32)
-                    request = self._request(pong_seat, PONG, obs_p, mask_p)
-                    pong_action = yield self._combine(pending[0], pending[1], request)
+                    pong_action = self._sl_decide(pong_seat, 'pong', mask_p,
+                                                   pending_claim_tile=discarded_tile)
+                    if pong_action is None:
+                        obs_p = self._build_obs(pong_seat,
+                                                 pending_claim_tile=discarded_tile)
+                        request = self._request(pong_seat, PONG, obs_p, mask_p)
+                        pong_action = yield self._combine(pending[0], pending[1], request)
 
                     if pong_action == 1:
                         sh_before = shanten_of(self._shanten_counts(pong_seat).tolist())
@@ -962,9 +1065,13 @@ class MultiAgentMahjongEnv:
                              if not self.riichi[chow_seat] and not self.force_closed[chow_seat]
                              else None)
                 if chow_mask is not None:
-                    obs_c = self._build_obs(chow_seat, pending_claim_tile=discarded_tile)
-                    request = self._request(chow_seat, CHOW, obs_c, chow_mask)
-                    chow_action = yield self._combine(pending[0], pending[1], request)
+                    chow_action = self._sl_decide(chow_seat, 'chow', chow_mask,
+                                                   pending_claim_tile=discarded_tile)
+                    if chow_action is None:
+                        obs_c = self._build_obs(chow_seat,
+                                                 pending_claim_tile=discarded_tile)
+                        request = self._request(chow_seat, CHOW, obs_c, chow_mask)
+                        chow_action = yield self._combine(pending[0], pending[1], request)
 
                     if chow_action != CHOW_PASS:
                         sh_before = shanten_of(self._shanten_counts(chow_seat).tolist())

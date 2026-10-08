@@ -5,12 +5,24 @@ Référence : Suphx paper §2.2, Fig. 4-5.
     Tronc   : 3x1 conv 256 -> 16 blocs résiduels (3x1 conv 256)
     Discard : 1x1 conv 1 -> flatten -> 34 logits (Fig. 4)
     Binaire : 3x1 conv 32 -> flatten -> 2 FC -> N sorties (Fig. 5)
+
+[RL] Support de l'oracle guiding (Suphx §3.3) :
+    - in_channels peut être étendu de N_CHANNELS (250) à
+      IN_CHANNELS_ORACLE (386) pour inclure les 136 canaux parfaits
+    - use_oracle=True dans build_model pour le faire automatiquement
+    - _load_partial_sl (dans oracle_agent.py) permet d'initialiser
+      les poids du tronc avec le SL : les canaux normaux sont copiés,
+      les canaux oracle sont initialisés à 0.
 """
 import torch
 import torch.nn as nn
 
 from mahjong_ai.envs.suphx_features import N_CHANNELS
 
+# Dimensions oracle : 3 mains adverses (3*34=102) + mur caché (34) = 136
+# 4 canaux oracle : 3 mains adverses + 1 mur cache
+ORACLE_DIM = 4
+IN_CHANNELS_ORACLE = N_CHANNELS + ORACLE_DIM   # 254
 
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
@@ -93,5 +105,14 @@ class SuphxModel(nn.Module):
         return self.head(self.trunk(x))
 
 
-def build_model(head_type, **kwargs):
+def build_model(head_type, use_oracle=False, **kwargs):
+    """Build Suphx model.
+
+    Args:
+        head_type  : 'discard' / 'riichi' / 'chow' / 'pong' / 'kong'
+        use_oracle : si True, force in_channels=IN_CHANNELS_ORACLE (386).
+                     Sinon, utilise in_channels du kwargs (defaut N_CHANNELS=250).
+    """
+    if use_oracle:
+        kwargs.setdefault('in_channels', IN_CHANNELS_ORACLE)
     return SuphxModel(head_type, **kwargs)

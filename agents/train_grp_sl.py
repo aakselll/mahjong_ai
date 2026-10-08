@@ -42,10 +42,11 @@ from mahjong_ai.sl.mjai_parser import parse_mjai_zst_file
 # ====================================================================== #
 # Constantes (identiques a training/game_env.py)
 # ====================================================================== #
-N_ROUNDS_REF = 8            # denominateur de progression (comme game_env.py)
+N_ROUNDS_REF = 4             # denominateur de progression (comme game_env.py)
 REWARD_SCALE = 1.0 / 1000.0  # points Tenhou -> unites reward
 RANK_REWARDS = {1: 15.0, 2: 5.0, 3: -5.0, 4: -15.0}
-MAX_ROUNDS = 16             # plafond de padding (au-dela, on tronque)
+MAX_ROUNDS = 16
+MAX_PHYSICAL_ROUNDS = 8           # plafond de padding (au-dela, on tronque)
 
 
 # ====================================================================== #
@@ -117,6 +118,8 @@ def extract_games_from_events(events):
             continue
 
         if ev_type == "start_kyoku":
+            if n_rounds >= MAX_PHYSICAL_ROUNDS:
+                break   # on a deja 4 rounds, on ignore la suite (South)
             s = ev.get("scores")
             if isinstance(s, list) and len(s) == 4:
                 scores = [float(x) for x in s]
@@ -139,7 +142,7 @@ def extract_games_from_events(events):
             _emit_round([float(x) for x in deltas], oya)
             continue
 
-    if n_rounds < 2:
+    if n_rounds < 4:
         return None
     if any(len(f) == 0 for f in feats_by_player):
         return None
