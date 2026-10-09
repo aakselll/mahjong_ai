@@ -619,7 +619,7 @@ class MultiAgentMahjongEnv:
             kyoutaku=self.riichi_deposits,
             seat=seat,
             pending_claim_tile=pending_claim_tile,
-            compute_lookahead_flag=True,
+
         )
         self._pending_oracle = self._build_oracle(seat)
         return obs

@@ -293,6 +293,27 @@ def train(args):
         critic_lr=args.critic_lr,
     )
 
+    # --- Resume (optionnel) ---
+    start_step = 0
+    if args.resume and os.path.isfile(args.resume):
+        print(f"[train_rl] resume depuis {args.resume}", flush=True)
+        ck = torch.load(args.resume, map_location=device, weights_only=False)
+        try:
+            agent.policy.load_state_dict(ck['policy'])
+            agent.critic.load_state_dict(ck['critic'])
+            start_step = ck.get('step', 0) or 0
+            # [FIX] Extrait le step du nom du fichier si absent du checkpoint
+            if start_step == 0:
+                import re
+                m = re.search(r'step(\d+)', args.resume)
+                if m:
+                    start_step = int(m.group(1))
+                    print(f"[train_rl]   step extrait du nom : {start_step}",
+                          flush=True)
+            print(f"[train_rl]   -> step charge = {start_step}", flush=True)
+        except Exception as e:
+            print(f"[train_rl] ECHEC resume : {e}", flush=True)
+
     # --- Publish initial ---
     publish_to_state(
         ps.state, ps.lock,
@@ -322,10 +343,12 @@ def train(args):
     print(f"[train_rl] {args.n_workers} workers lances", flush=True)
 
     # --- Boucle ---
-    step = 0
+    step = start_step
     alpha = args.alpha_init
     recent_entropies = []
-    current_phase = 1
+    # Si on resume dans une phase avancee, on demarre dans cette phase
+    current_phase, _, _ = get_phase_and_gamma(
+        step, args.total_steps, args.oracle_frac, args.transition_frac)
     base_lr = args.lr
     t_start = time.time()
     n_updates = 0
@@ -373,24 +396,52 @@ def train(args):
         # --- Update ---
         advantages = compute_advantages(batch, gamma=args.gamma, lam=args.lam)
 
-        agent.policy_optim.zero_grad()
-        agent.critic_optim.zero_grad()
-        iw_thresh = args.iw_threshold if phase == 3 else None
-        policy_loss, value_loss, entropy = pg_is_loss(
-            agent, batch, advantages, gamma_t,
-            clip_eps=args.clip_eps, iw_threshold=iw_thresh, phase=phase)
+        # Multi-epoch PPO : plusieurs passes de gradient par batch
+        PPO_EPOCHS = args.ppo_epochs
+        policy_loss_last = None
+        value_loss_last = None
+        entropy_last = None
 
-        if policy_loss is None:
+        policy_gnorm_last = None
+        critic_gnorm_last = None
+
+        for epoch_i in range(PPO_EPOCHS):
+            agent.policy_optim.zero_grad()
+            agent.critic_optim.zero_grad()
+            iw_thresh = args.iw_threshold if phase == 3 else None
+            policy_loss, value_loss, entropy = pg_is_loss(
+                agent, batch, advantages, gamma_t,
+                clip_eps=args.clip_eps, iw_threshold=iw_thresh, phase=phase)
+            if policy_loss is None:
+                break
+            loss = policy_loss + args.value_coef * value_loss - alpha * entropy
+            loss.backward()
+            # [FIX] capture les grad norms pour le log DRIFT
+            policy_gnorm_last = torch.nn.utils.clip_grad_norm_(
+                agent.policy.parameters(), 5.0)
+            critic_gnorm_last = torch.nn.utils.clip_grad_norm_(
+                agent.critic.parameters(), 5.0)
+            agent.policy_optim.step()
+            agent.critic_optim.step()
+            policy_loss_last = policy_loss
+            value_loss_last = value_loss
+            entropy_last = entropy
+
+        if policy_loss_last is None:
             continue
+        policy_loss = policy_loss_last
+        value_loss = value_loss_last
+        entropy = entropy_last
+        policy_gnorm = policy_gnorm_last if policy_gnorm_last is not None \
+            else torch.tensor(0.0)
+        critic_gnorm = critic_gnorm_last if critic_gnorm_last is not None \
+            else torch.tensor(0.0)
 
-        loss = policy_loss + args.value_coef * value_loss - alpha * entropy
-        loss.backward()
-        policy_gnorm = torch.nn.utils.clip_grad_norm_(
-            agent.policy.parameters(), 5.0)
-        critic_gnorm = torch.nn.utils.clip_grad_norm_(
-            agent.critic.parameters(), 5.0)
-        agent.policy_optim.step()
-        agent.critic_optim.step()
+        if policy_loss_last is None:
+            continue
+        policy_loss = policy_loss_last
+        value_loss = value_loss_last
+        entropy = entropy_last
 
         step += len(batch)
         n_updates += 1
@@ -457,14 +508,15 @@ def train(args):
             base = args.output[:-3] if args.output.endswith('.pt') else args.output
             step_path = f"{base}_step{step:07d}.pt"
             latest_path = f"{base}_latest.pt"
-            agent.save(step_path)
-            agent.save(latest_path)
+            agent.save(step_path, step=step)
+            agent.save(latest_path, step=step)
+
             if args.keep_last_n > 0:
                 _purge_old_checkpoints(base, args.keep_last_n)
             print(f"[step {step}] save {step_path} + {latest_path}",
                   flush=True)
 
-    agent.save(args.output)
+    agent.save(args.output, step=step)
     print(f"[train_rl] termine. Checkpoint : {args.output}", flush=True)
     for w in workers:
         w.terminate()
@@ -482,7 +534,7 @@ def main():
     p.add_argument('--games-per-cycle', type=int, default=10)
     p.add_argument('--buffer-size', type=int, default=500)
     p.add_argument('--batch-episodes', type=int, default=20)
-    p.add_argument('--max-batch-transitions', type=int, default=4000)
+    p.add_argument('--max-batch-transitions', type=int, default=1000)
 
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--critic-lr', type=float, default=3e-3)
@@ -505,6 +557,12 @@ def main():
     p.add_argument('--publish-every', type=int, default=2000)
     p.add_argument('--save-every', type=int, default=50000)
     p.add_argument('--log-every', type=int, default=2000)
+
+    p.add_argument('--resume', type=str, default=None,
+                   help='chemin vers un checkpoint _latest.pt pour reprendre')
+    p.add_argument('--ppo-epochs', type=int, default=3,
+                   help='nombre d\'epochs PPO par batch (defaut 3)')
+    
     args = p.parse_args()
     train(args)
 
