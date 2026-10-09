@@ -295,6 +295,8 @@ def train(args):
 
     # --- Resume (optionnel) ---
     start_step = 0
+    start_alpha = args.alpha_resume if args.alpha_resume is not None \
+                  else args.alpha_init
     if args.resume and os.path.isfile(args.resume):
         print(f"[train_rl] resume depuis {args.resume}", flush=True)
         ck = torch.load(args.resume, map_location=device, weights_only=False)
@@ -302,7 +304,9 @@ def train(args):
             agent.policy.load_state_dict(ck['policy'])
             agent.critic.load_state_dict(ck['critic'])
             start_step = ck.get('step', 0) or 0
-            # [FIX] Extrait le step du nom du fichier si absent du checkpoint
+            start_alpha = ck.get('alpha', args.alpha_init) or args.alpha_init
+
+            # Extraction depuis le nom si step=0
             if start_step == 0:
                 import re
                 m = re.search(r'step(\d+)', args.resume)
@@ -310,7 +314,9 @@ def train(args):
                     start_step = int(m.group(1))
                     print(f"[train_rl]   step extrait du nom : {start_step}",
                           flush=True)
-            print(f"[train_rl]   -> step charge = {start_step}", flush=True)
+
+            print(f"[train_rl]   -> step={start_step}, alpha={start_alpha:.4f}",
+                  flush=True)
         except Exception as e:
             print(f"[train_rl] ECHEC resume : {e}", flush=True)
 
@@ -344,7 +350,7 @@ def train(args):
 
     # --- Boucle ---
     step = start_step
-    alpha = args.alpha_init
+    alpha = start_alpha
     recent_entropies = []
     # Si on resume dans une phase avancee, on demarre dans cette phase
     current_phase, _, _ = get_phase_and_gamma(
@@ -502,19 +508,19 @@ def train(args):
             for a in alerts:
                 print(f"    | !! {a}", flush=True)
 
-        # --- Save ---
+
         if step % args.save_every < len(batch):
             os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
             base = args.output[:-3] if args.output.endswith('.pt') else args.output
             step_path = f"{base}_step{step:07d}.pt"
             latest_path = f"{base}_latest.pt"
-            agent.save(step_path, step=step)
-            agent.save(latest_path, step=step)
-
+            agent.save(step_path)
+            agent.save(latest_path)
             if args.keep_last_n > 0:
                 _purge_old_checkpoints(base, args.keep_last_n)
             print(f"[step {step}] save {step_path} + {latest_path}",
                   flush=True)
+
 
     agent.save(args.output, step=step)
     print(f"[train_rl] termine. Checkpoint : {args.output}", flush=True)
@@ -562,6 +568,9 @@ def main():
                    help='chemin vers un checkpoint _latest.pt pour reprendre')
     p.add_argument('--ppo-epochs', type=int, default=3,
                    help='nombre d\'epochs PPO par batch (defaut 3)')
+
+    p.add_argument('--alpha-resume', type=float, default=None,
+                   help='valeur de alpha au resume (defaut: args.alpha_init)')
     
     args = p.parse_args()
     train(args)

@@ -144,10 +144,10 @@ class OracleDiscardAgent:
         return logp, values, entropy
 
     # ------------------------------------------------------------------ #
-    def save(self, path, step=None):
-        """Sauvegarde policy + critic + step (pour reprise)."""
+    def save(self, path, step=None, alpha=None):
         torch.save({
             'policy': self.policy.state_dict(),
             'critic': self.critic.state_dict(),
             'step': step,
+            'alpha': alpha,          # <-- AJOUT
         }, path)
