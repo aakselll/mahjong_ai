@@ -106,8 +106,10 @@ class GameEnv:
         return [(self.dealer_seat + i) % 4 for i in range(4)]
 
     def reset_round(self):
-        if (self.round_num > self.n_rounds
-                or self.kyoku_count >= MAX_KYOKU
+        # n_rounds indique le nombre de manches normales avant l'enchousen,
+        # pas une limite de reset. En tonpuu, round 5+ est l'extension de la
+        # meme partie et ne doit pas demarrer une nouvelle partie.
+        if (self.kyoku_count >= MAX_KYOKU
                 or self.end_reason is not None):
             self._reset_game_state()
         mapping = self._seat_mapping()
