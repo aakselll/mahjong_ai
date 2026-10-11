@@ -1,31 +1,41 @@
 """
-Etape 4 du curriculum : Global Reward Prediction (GRP).
+Etape 4 du curriculum : Global Reward Prediction (GRP) avec regles
+Mahjong Soul completes.
 
-[FIDELITE PAPIER] Ajout du repeat dealer et honba (Tenhou rules).
-Layout : East 1 -> repeat -> East 1 honba 1 -> ... -> East 4 -> fin.
+[TONPUUSEN ONLY] Le modele est entraine sur des parties East-only
+(4 manches max, sans enchousen). Pour rester coherent :
+    - Le self-play worker utilise n_rounds=4
+    - La progression du GRP est normalisee sur 8 (East 1-4 + repeats max)
 
-Conditions repeat dealer :
-    - Dealer win (tsumo/ron)         -> repeat, honba+1
-    - Dealer tenpai at exhaustive    -> repeat, honba+1
-    - Abortive draw                  -> repeat, honba inchange
-    - Sinon                          -> dealer passe, round_num+1
-
-[FIX 2025-XX] Progression GRP : utilise kyoku_count (nombre de manches
-jouees, repeats inclus) normalise sur 4, au lieu de (round_num - 1) / 4.
-Coherent avec train_grp_sl.py qui utilise min(round_idx + 1, N_ROUNDS_REF)
-/ N_ROUNDS_REF. Le GRP East-4 attend {0.25, 0.5, 0.75, 1.0}.
+Regles implementees :
+    - Renchan, Honba (illimite)
+    - Tobi : fin si un joueur passe sous 0 absolu
+    - Agari Yame : all last + dealer 1er + gagne -> fin
+    - Tenpai Yame : all last + dealer 1er + tenpai sur ryuukyoku -> fin
+    - Oorasu : fin East 4 si quelqu'un >= 30k
+    - Enchousen (Sud 1-4) : implemente mais DESACTIVE en pratique
+      (le worker passe n_rounds=4, donc round_num ne depasse jamais 4)
 """
 import numpy as np
 
 from mahjong_ai.envs.multi_agent import MultiAgentMahjongEnv, REWARD_SCALE
+from mahjong_ai.envs.tiles import shanten_of
 from mahjong_ai.agents.reward_predictor import FEATURE_DIM
 
-N_ROUNDS = 4        # East 1-4 (tonpuusen)
-MAX_KYOKU = 30      # safety anti-boucle-infinie
+
+# ─── Constantes Mahjong Soul ────────────────────────────────────────────
+N_ROUNDS_NORMAL = 4     # East 1-4 (fin normale)
+N_ROUNDS_MAX = 8        # East 1-4 + Sud 1-4 (max enchousen)
+MAX_KYOKU = 30          # securite anti-boucle
+
+TARGET_SCORE = 5.0      # 30000 absolus - 25000 = +5.0 en milliers
+TOBI_THRESHOLD = -25.0  # 0 absolu - 25000 = -25.0 en milliers
 
 RANK_REWARDS = {1: 15.0, 2: 5.0, 3: -5.0, 4: -15.0}
 
-MAX_REPEATS_PER_ROUND = 2
+# [FIX] Progression normalisee sur 8 (tonpuusen : East 1-4 + repeats)
+N_ROUNDS_REF = 8
+
 
 class PredictorHolder:
     def __init__(self):
@@ -57,9 +67,8 @@ def _rank_rewards_from_scores(scores):
     return rewards
 
 
-def _decide_dealer_repeat(outcome, dealer_round_reward, current_honba=0):
-    if current_honba >= MAX_REPEATS_PER_ROUND:
-        return False, False
+def _decide_dealer_repeat(outcome, dealer_round_reward):
+    """Retourne (dealer_repeats, honba_increments)."""
     if outcome.startswith("abortive"):
         return True, False
     if outcome == "exhaustive":
@@ -68,13 +77,17 @@ def _decide_dealer_repeat(outcome, dealer_round_reward, current_honba=0):
     repeats = dealer_round_reward > 0
     return repeats, repeats
 
+
 class GameEnv:
     def __init__(self, seed=None, predictor_holder=None,
-                 game_log_buffer=None, n_rounds=N_ROUNDS):
+                 game_log_buffer=None, n_rounds=N_ROUNDS_MAX,
+                 game_format=None):
         self.round_env = MultiAgentMahjongEnv(seed=seed)
         self.predictor_holder = predictor_holder or PredictorHolder()
         self.game_log_buffer = game_log_buffer
         self.n_rounds = n_rounds
+        self.game_format = game_format or (
+            "tonpuu" if n_rounds <= N_ROUNDS_NORMAL else "hanchan")
         self._reset_game_state()
 
     def _reset_game_state(self):
@@ -86,16 +99,19 @@ class GameEnv:
         self.feature_history = [[] for _ in range(4)]
         self.hidden_states = [None] * 4
         self.prev_phi = [0.0] * 4
+        self.is_enchousen = False
+        self.end_reason = None
 
     def _seat_mapping(self):
         return [(self.dealer_seat + i) % 4 for i in range(4)]
 
     def reset_round(self):
         if (self.round_num > self.n_rounds
-                or self.kyoku_count >= MAX_KYOKU):
+                or self.kyoku_count >= MAX_KYOKU
+                or self.end_reason is not None):
             self._reset_game_state()
         mapping = self._seat_mapping()
-        round_wind_idx = (self.round_num - 1) // 4  # East=0, South=1
+        round_wind_idx = (self.round_num - 1) // 4
         self.round_env.set_game_context(
             round_wind_idx=round_wind_idx,
             round_idx=self.round_num - 1,
@@ -110,6 +126,61 @@ class GameEnv:
         translated = dict(req)
         translated["seat"] = mapping[req["seat"]]
         return translated
+
+    def _is_all_last(self):
+        if not self.is_enchousen:
+            return self.round_num == N_ROUNDS_NORMAL
+        return self.round_num == N_ROUNDS_MAX
+
+    def _check_game_end(self, outcome, dealer_repeats, dealer_real,
+                         dealer_round_reward):
+        """Regles Mahjong Soul (tobi, agari yame, tenpai yame, oorasu,
+        enchousen, max_kyoku)."""
+        ranks = self._current_ranks()
+        dealer_rank = ranks[dealer_real]
+
+        # 1. Tobi
+        if any(s <= TOBI_THRESHOLD for s in self.game_scores):
+            return True, "tobi"
+
+        # 2-3. Agari yame / Tenpai yame : all last + dealer 1er
+        if self._is_all_last() and dealer_rank == 1:
+            dealer_won = (outcome in ("tsumo", "ron", "multi_ron")
+                          and dealer_round_reward > 0)
+            if dealer_won:
+                return True, "agari_yame"
+
+            if outcome == "exhaustive":
+                try:
+                    dealer_tenpai = shanten_of(
+                        self.round_env._shanten_counts(0).tolist()) == 0
+                    if dealer_tenpai:
+                        return True, "tenpai_yame"
+                except Exception:
+                    pass
+
+        # 4. Enchousen : agari qui porte un joueur a 30k+
+        if self.is_enchousen and outcome in ("tsumo", "ron", "multi_ron"):
+            if any(s >= TARGET_SCORE for s in self.game_scores):
+                return True, "enchousen_30k"
+
+        # 5. Fin d'East 4
+        current_round = self.round_num
+        if current_round == N_ROUNDS_NORMAL and not dealer_repeats:
+            if any(s >= TARGET_SCORE for s in self.game_scores):
+                return True, "oorasu"
+            return False, None
+
+        # 6. Fin forcee a Sud 4 sans repeat
+        if (self.is_enchousen and current_round == N_ROUNDS_MAX
+                and not dealer_repeats):
+            return True, "enchousen_max"
+
+        # 7. Limite securite
+        if self.kyoku_count + 1 >= MAX_KYOKU:
+            return True, "max_kyoku"
+
+        return False, None
 
     def step(self, action):
         result = self.round_env.step(action)
@@ -136,15 +207,11 @@ class GameEnv:
         for p in range(4):
             self.game_scores[p] += real_round_rewards[p]
 
+        # ---- GRP reward ----
         ranks = self._current_ranks()
         grp_rewards = {}
-
-        # [FIX] Progression normalisee sur n_rounds (=4), comptant les
-        # manches jouees (repeats inclus) pour matcher train_grp_sl.py.
-        # kyoku_count est le nombre de manches DEJA terminees, donc
-        # l'indice de la manche courante est kyoku_count + 1 (1-indexe).
-        progression = min(self.kyoku_count + 1, self.n_rounds) \
-            / float(self.n_rounds)
+        format_rounds = (4 if self.game_format == "tonpuu" else 8)
+        progression = min(self.kyoku_count + 1, format_rounds) / float(format_rounds)
 
         for p in range(4):
             gap_leader = max(self.game_scores) - self.game_scores[p]
@@ -153,11 +220,19 @@ class GameEnv:
                 real_round_rewards[p],
                 self.game_scores[p],
                 is_dealer_flag[p],
-                progression,           # <-- CORRIGE : etait (round_num-1)/4
+                progression,
                 riichi_flags[p],
                 ranks[p] / 4.0,
                 gap_leader,
                 gap_last,
+                1.0 if self.game_format == "tonpuu" else 0.0,
+                1.0 if self.game_format == "hanchan" else 0.0,
+                1.0 if self.round_num == format_rounds else 0.0,
+                1.0 if self.round_num > format_rounds else 0.0,
+                min(max(self.honba, 0), 4) / 4.0,
+                min(max(self.round_env.riichi_deposits, 0), 4) / 4.0,
+                max(format_rounds - self.round_num, 0)
+                / float(format_rounds),
             ], dtype=np.float32)
             self.feature_history[p].append(feat)
 
@@ -171,25 +246,34 @@ class GameEnv:
                 grp_rewards[p] = phi_k - self.prev_phi[p]
                 self.prev_phi[p] = phi_k
 
-        # Decide repeat
+        # ---- Decide repeat dealer ----
         outcome = result.get('outcome', 'unknown')
         dealer_real = mapping[0]
         dealer_round_reward = real_round_rewards[dealer_real]
         dealer_repeats, honba_increments = _decide_dealer_repeat(
-            outcome, dealer_round_reward, self.honba)
+            outcome, dealer_round_reward)
 
-        if dealer_repeats:
-            if honba_increments:
-                self.honba += 1
-        else:
-            self.honba = 0
-            self.dealer_seat = (self.dealer_seat + 1) % 4
-            self.round_num += 1
+        # ---- [MAHJONG SOUL] Regles de fin ----
+        game_done, end_reason = self._check_game_end(
+            outcome, dealer_repeats, dealer_real, dealer_round_reward)
+
+        # ---- Mise a jour du round si pas fin ----
+        if not game_done:
+            if dealer_repeats:
+                if honba_increments:
+                    self.honba += 1
+            else:
+                self.honba = 0
+                self.dealer_seat = (self.dealer_seat + 1) % 4
+                self.round_num += 1
+                if self.round_num == N_ROUNDS_NORMAL + 1:
+                    self.is_enchousen = True
 
         self.kyoku_count += 1
-        game_done = (self.round_num > self.n_rounds
-                     or self.kyoku_count >= MAX_KYOKU)
+        if game_done:
+            self.end_reason = end_reason
 
+        # ---- Log final ----
         if game_done and self.game_log_buffer is not None:
             final_rewards_by_rank = _rank_rewards_from_scores(self.game_scores)
             for p in range(4):
@@ -200,6 +284,7 @@ class GameEnv:
         translated["final_rewards"] = grp_rewards
         translated["acting_seat"] = None
         translated["game_done"] = game_done
+        translated["end_reason"] = end_reason
         return translated
 
     def _current_ranks(self):

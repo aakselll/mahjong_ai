@@ -22,7 +22,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-FEATURE_DIM = 8  # taille du vecteur de features construit dans game_env.py (par manche, par joueur)
+FEATURE_DIM = 15  # 8 features + format + horizon + honba/kyotaku
 
 
 class RewardPredictor(nn.Module):

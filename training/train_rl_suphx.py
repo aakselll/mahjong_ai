@@ -264,8 +264,12 @@ def pg_is_loss(agent, transitions, advantages, gamma_t,
 # Boucle principale
 # ---------------------------------------------------------------------- #
 def train(args):
-    device = 'cpu'
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if device == 'cuda':
+        print(f"[train_rl] GPU detected : {torch.cuda.get_device_name(0)}")
+        print(f"[train_rl] VRAM : {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     os.environ["RL_N_WORKERS"] = str(args.n_workers)
+
     torch.set_num_threads(2)
 
     print(f"[train_rl] device={device}, n_workers={args.n_workers}",
@@ -340,7 +344,7 @@ def train(args):
                 stats_proxy,                        # <-- NOUVEAU
                 args.sl_discard, args.sl_frozen,
                 args.grp_checkpoint,
-                args.games_per_cycle, device,
+                args.games_per_cycle, device
             ),
             daemon=True,
         )

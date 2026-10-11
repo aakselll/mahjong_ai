@@ -107,6 +107,7 @@ def train(args):
     ds = PolicyDataset(
         files, args.head, cache_path=cache, verbose=True,
         parse_workers=args.parse_workers,
+        game_format=args.game_format,
     )
     if len(ds) == 0:
         raise RuntimeError(f'Aucun echantillon pour {args.head}')
@@ -276,6 +277,10 @@ def main():
     p.add_argument('--data-dir', required=True)
     p.add_argument('--cache-dir', default=None)
     p.add_argument('--max-files', type=int, default=None)
+    p.add_argument('--game-format',
+                   choices=['hanchan', 'tonpuu', 'both'],
+                   default='hanchan',
+                   help='horizon features a entrainer (defaut: hanchan)')
     p.add_argument('--output', required=True)
 
     # Warm-start : charge un checkpoint existant de la MEME tete.

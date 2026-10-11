@@ -5,11 +5,9 @@ Chaque fichier .mjai.json.zst contient une sequence d'evenements JSON
 (compresses en zstd, streaming). On reconstruit l'etat de jeu et on extrait
 des echantillons (obs Suphx, action_type, action, mask).
 
-[REFONTE FEATURES] L'observation est une matrice (N_CHANNELS, 34) produite
-par envs/suphx_features.py. Ajouts par rapport a la version precedente :
-  - kyoutaku tracke entre kyoku (persiste jusqu'a un win)
-  - furiten permanent calcule pour le POV
-  - last_discard + tsumogiri par siege
+[FILTRE TONPUUSEN] Seules les parties SANS manche Sud sont gardees.
+Cela garantit que le SL apprend les strategies "East-only"
+(agari yame, tenpai yame, tobi a East 4 = derniere manche).
 
 Extrait aussi les SKIPS (appels/riichi possibles non pris) pour eviter
 que les tetes binaires n'apprennent que "toujours oui".
@@ -59,6 +57,52 @@ def mjai_tiles_to_counts(tiles):
         if 0 <= idx < N_TILES:
             counts[idx] += 1
     return counts
+
+
+def is_tonpuusen(events):
+    """Retourne True si la partie ne joue aucune manche Sud."""
+    return not any(
+        ev.get("type") == "start_kyoku" and ev.get("bakaze") == "S"
+        for ev in events
+    )
+
+
+def _round_context(event, game_format):
+    """Construit l'horizon abstrait utilise par les features."""
+    bakaze = event.get("bakaze", "E")
+    kyoku = int(event.get("kyoku", 1) or 1)
+    if game_format == "tonpuu":
+        normal_round_count = 4
+        absolute_round = kyoku if bakaze == "E" else 4 + kyoku
+    elif game_format == "hanchan":
+        normal_round_count = 8
+        if bakaze == "E":
+            absolute_round = kyoku
+        elif bakaze == "S":
+            absolute_round = 4 + kyoku
+        else:
+            absolute_round = 8 + kyoku
+    else:
+        raise ValueError(f"format inconnu: {game_format}")
+    return {
+        "game_format": game_format,
+        "normal_round_count": normal_round_count,
+        "is_last_normal_round": absolute_round == normal_round_count,
+        "is_extension": absolute_round > normal_round_count,
+        "extension_index": max(0, absolute_round - normal_round_count),
+        "round_progress": absolute_round,
+    }
+
+
+def _tonpuu_projection(events):
+    """Garde la partie Est pour creer un episode tonpuu."""
+    first_south = next(
+        (i for i, event in enumerate(events)
+         if event.get("type") == "start_kyoku"
+         and event.get("bakaze") != "E"),
+        len(events),
+    )
+    return events[:first_south]
 
 
 # ====================================================================== #
@@ -138,12 +182,11 @@ class GameState:
 
 
 # ====================================================================== #
-# Furiten pour le POV (permanent seulement, cf. note en tete)
+# Furiten pour le POV (permanent seulement)
 # ====================================================================== #
 def _pov_furiten(state, pov):
     """Permanent furiten : tenpai ET au moins une tuile d'attente dans
-    ses propres defausses. Pas de detection de furiten temporaire
-    (necessite de voir un ron refuse, absent des events MJAI standards)."""
+    ses propres defausses."""
     counts = state.get_shanten_counts(pov)
     if int(counts.sum()) >= 14:
         return False
@@ -170,9 +213,14 @@ def _pov_furiten(state, pov):
 _RW_MAP = {"E": 0, "S": 1, "W": 2, "N": 3}
 
 
-def build_obs(state, pov):
+def build_obs(state, pov, context=None):
     round_wind = _RW_MAP.get(state.bakaze, 0)
     scores_k = [(s - 25000.0) / 1000.0 for s in state.scores]
+    context = context or getattr(state, "_feature_context", None)
+    if context is None:
+        context = _round_context(
+            {"bakaze": state.bakaze, "kyoku": state.kyoku}, "hanchan"
+        )
     return build_suphx_obs(
         hands=state.hands,
         melds=state.melds,
@@ -191,6 +239,7 @@ def build_obs(state, pov):
         seat=pov,
         pending_claim_tile=state.pending_tile,
         compute_lookahead_flag=True,
+        **context,
     )
 
 
@@ -314,7 +363,7 @@ def _flush_skips(samples, state, pov, pending_calls):
 # ====================================================================== #
 # Conversion partie -> echantillons
 # ====================================================================== #
-def events_to_samples(events, pov=0):
+def events_to_samples(events, pov=0, game_format="hanchan"):
     samples = []
     state = GameState()
     pending_calls = {}
@@ -354,6 +403,7 @@ def events_to_samples(events, pov=0):
             if dora:
                 state.dora_indicators = [mjai_tile_to_34(dora)]
             state.wall_remaining = 70
+            state._feature_context = _round_context(ev, game_format)
             pending_calls = {}
             pending_riichi_check = False
             continue
@@ -460,12 +510,9 @@ def events_to_samples(events, pov=0):
                                 np.array([1.0, 1.0], dtype=np.float32)))
             if actor is not None:
                 state.riichi[actor] = True
-                # NE PAS incrémenter kyoutaku ici : le ron sur la tuile de
-                # riichi empêche la validation, donc pas de dépôt.
             pending_riichi_check = False
             continue
 
-        # NOUVEAU : reach_accepted = riichi validé (dépôt 1000 pts au pot)
         if ev_type == "reach_accepted":
             actor = ev.get("actor")
             if actor is not None:
@@ -490,16 +537,6 @@ def events_to_samples(events, pov=0):
             elif target is not None and pov in pending_calls:
                 if pending_calls[pov].get("ron"):
                     _extract_pov_skip(samples, state, pov, pending_calls[pov])
-
-            # NOUVEAU : si le ron tombe sur une tuile de riichi non validée,
-            # on annule l'état riichi qui avait été posé prématurément au
-            # reach (le reach_accepted n'arrivera jamais).
-            if target is not None and actor != target:
-                # target = discarder ; si lui avait un riichi pending, on l'annule
-                # (dans les logs MJAI, un ron sur la tuile de riichi fait
-                # échouer le reach_accepted)
-                pass  # la logique exacte dépend de si reach_accepted est émis
-
             pending_calls = {}
             state.pending_tile = None
             state.kyoutaku = 0    # le gagnant ramasse le pot
@@ -508,8 +545,20 @@ def events_to_samples(events, pov=0):
     return samples
 
 
-def events_to_samples_all_povs(events):
+def events_to_samples_all_povs(events, game_format="hanchan"):
+    """Extrait des vues hanchan, tonpuu ou les deux."""
+    if game_format not in ("hanchan", "tonpuu", "both"):
+        raise ValueError(f"format inconnu: {game_format}")
+    if game_format == "both":
+        return (
+            events_to_samples_all_povs(events, "hanchan")
+            + events_to_samples_all_povs(events, "tonpuu")
+        )
+    if game_format == "tonpuu":
+        events = _tonpuu_projection(events)
     samples = []
     for pov in range(4):
-        samples.extend(events_to_samples(events, pov=pov))
+        samples.extend(events_to_samples(
+            events, pov=pov, game_format=game_format
+        ))
     return samples

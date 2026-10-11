@@ -120,9 +120,13 @@ Reference paper scale:    C=256, N_blocks=50  ->  ~21M params
 Reward Predictor (GRP)
 ----------------------
 
-  * Input: per-round feature vector (FEATURE_DIM=8) sequence
+  * Input: per-round feature vector (FEATURE_DIM=15) sequence
+    (8 game features + format, horizon flags, honba, kyotaku and
+    normalized rounds remaining)
+    (8 game features + explicit tonpuu/hanchan format flags)
   * 2-layer GRU (hidden=64 or 128) + 2 FC layers -> scalar output
-  * Trained by MSE on final rank rewards
+  * Trained by MSE on final rank rewards, with separate hanchan and tonpuu
+    views extracted from the same hanchan logs
   * Frozen during RL (as in the paper)
 
 
@@ -130,11 +134,16 @@ Reward Predictor (GRP)
 4. INPUT FEATURES
 ================================================================================
 
-The observation is a matrix (N_CHANNELS=250, 34), one row per tile type.
+The observation is a matrix (N_CHANNELS, 34), one row per tile type.
 This follows Suphx section 2.2: each feature occupies a 34-wide channel.
 
   Group                          Channels    Encoding
   ---------------------------------------------------------------------------
+  Horizon format                    2         tonpuu / hanchan
+  Last normal round                 1         one-hot flag
+  Extension                         1         one-hot flag
+  Extension index                   8         one-hot bucket
+  Round progress                   10         one-hot bucket
   Own hand                          4         "n copies" (Fig. 3):
                                               channel n = 1 if count >= n+1
   Own open melds                    4         same

@@ -61,13 +61,13 @@ LOG_INTERVAL_S = 20     # intervalle max entre deux logs de progression
 # ====================================================================== #
 def _parse_one_file(task):
     """Parse UN fichier -> (file_id, samples_list_or_None)."""
-    file_id, path = task
+    file_id, path, game_format = task
     try:
         events = parse_mjai_zst_file(path)
         if not events:
             return file_id, []
         out = []
-        for s in events_to_samples_all_povs(events):
+        for s in events_to_samples_all_povs(events, game_format=game_format):
             obs, atype, action, _mask = s
             obs_u8 = np.clip(
                 np.round(np.asarray(obs, dtype=np.float32) * 255.0),
@@ -208,9 +208,12 @@ class PolicyDataset(Dataset):
     """
 
     def __init__(self, files, head_type, cache_path=None, verbose=True,
-                 parse_workers=1, shard_size=SHARD_SIZE):
+                 parse_workers=1, shard_size=SHARD_SIZE, game_format="hanchan"):
         assert head_type in HEAD_TO_ACTION_TYPE, f'Tete inconnue : {head_type}'
         self.head_type = head_type
+        if game_format not in ("hanchan", "tonpuu", "both"):
+            raise ValueError(f"format inconnu: {game_format}")
+        self.game_format = game_format
         self.action_type = HEAD_TO_ACTION_TYPE[head_type]
         self._parse_workers = max(1, int(parse_workers))
         self._shard_size = max(1, int(shard_size))
@@ -236,6 +239,23 @@ class PolicyDataset(Dataset):
         # 2) Etat actuel
         n_files_total = len(files)
         start_file_id = _scan_last_file_id(shard_dir)
+        if os.path.isfile(meta_path):
+            with open(meta_path, 'rb') as f:
+                meta = pickle.load(f)
+            if (meta.get('game_format') != self.game_format
+                    or meta.get('n_channels') != N_CHANNELS):
+                raise RuntimeError(
+                    'Cache incompatible avec le format ou les features: '
+                    f'cache={meta.get("game_format")}/'
+                    f'{meta.get("n_channels")}, '
+                    f'actuel={self.game_format}/{N_CHANNELS}. '
+                    f'Supprimez {shard_dir}/ et {meta_path}.'
+                )
+        elif _has_shards(shard_dir):
+            raise RuntimeError(
+                f'Metadonnees absentes pour le cache {shard_dir}. '
+                'Supprimez ce cache pour le regenerer.'
+            )
 
         if verbose:
             n_shards = _count_shards(shard_dir)
@@ -278,7 +298,8 @@ class PolicyDataset(Dataset):
             print(f'[dataset/{self.head_type}] parse sans cache '
                   f'({self._parse_workers} worker(s))...', flush=True)
         t0 = time.time()
-        tasks = list(enumerate(files))
+        tasks = [(i, path, self.game_format)
+                 for i, path in enumerate(files)]
         out = []
         if self._parse_workers <= 1:
             for task in tasks:
@@ -322,9 +343,23 @@ class PolicyDataset(Dataset):
                     f'{shard_dir}/ et {meta_path} pour reparcourir, ou '
                     f'revenez a la config d\'origine.'
                 )
+            if (meta.get('game_format') != self.game_format
+                    or meta.get('n_channels') != N_CHANNELS):
+                raise RuntimeError(
+                    'Cache incompatible avec le format ou les features: '
+                    f'cache={meta.get("game_format")}/'
+                    f'{meta.get("n_channels")}, '
+                    f'actuel={self.game_format}/{N_CHANNELS}. '
+                    f'Supprimez {shard_dir}/ et {meta_path}.'
+                )
         else:
             with open(meta_path, 'wb') as f:
-                pickle.dump({'signature': sig, 'created': time.time()}, f)
+                pickle.dump({
+                    'signature': sig,
+                    'created': time.time(),
+                    'game_format': self.game_format,
+                    'n_channels': N_CHANNELS,
+                }, f)
 
         if verbose:
             print(f'[dataset/{self.head_type}] parsing {n} fichiers '
@@ -332,7 +367,8 @@ class PolicyDataset(Dataset):
                   f'shard_size={self._shard_size}...', flush=True)
 
         t_start = time.time()
-        tasks = [(fid, files[fid]) for fid in range(start_id, end_id)]
+        tasks = [(fid, files[fid], self.game_format)
+                 for fid in range(start_id, end_id)]
 
         # Buffers de shard (mutables via dict)
         state = {
@@ -395,7 +431,7 @@ class PolicyDataset(Dataset):
 
         if self._parse_workers <= 1:
             for fid, path in tasks:
-                _fid, samples = _parse_one_file((fid, path))
+                _fid, samples = _parse_one_file((fid, path, self.game_format))
                 process(_fid, samples)
                 log_progress()
         else:

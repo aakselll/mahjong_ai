@@ -54,7 +54,8 @@ def worker_loop(worker_id, state, lock, buffer_data, buffer_max,
 
     # --- GameEnv 4-round East ---
     env = GameEnv(seed=worker_id, predictor_holder=predictor_holder,
-                  game_log_buffer=None, n_rounds=4)
+                  game_log_buffer=None, n_rounds=4,
+                  game_format="tonpuu")
     env.round_env.frozen_sl = agent.frozen_sl
 
     print(f"[worker {worker_id}] demarre (n_rounds=4)", flush=True)

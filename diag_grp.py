@@ -8,7 +8,7 @@ samples = data['samples']
 print(f"{len(samples)} sequences")
 
 model = RewardPredictor(input_dim=FEATURE_DIM, hidden_dim=128, num_layers=2)
-model.load_state_dict(torch.load('checkpoints/grp_sl_east4.pt', map_location='cpu'))
+model.load_state_dict(torch.load('checkpoints/grp_sl_v4.pt', map_location='cpu'))
 model.eval()
 
 preds_final = []

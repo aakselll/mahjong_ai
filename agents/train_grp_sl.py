@@ -1,34 +1,23 @@
 """
 Entrainement supervise du Global Reward Predictor (GRP) sur des logs humains.
 
-[SUIVI DE SUPHX] Dans le papier Suphx (Section 3.2), le reward predictor Phi
-est entraine en SL sur des logs de joueurs humains 10-dan (100M+ manches),
-puis FIGE pendant tout le RL. C'est ce qui lui permet d'apprendre les
-strategies contextuelles des humains ("fold quand 1er avec avance", "attaque
-quand 4e") -- patterns qu'un GRP entraine sur du self-play stEREotype ne peut
-pas capturer.
+[SUIVI DE SUPHX] GRU 2 couches + 2 FC, entraine par MSE sur le rank reward.
 
-Ce script :
-    1. Parse les fichiers .mjai.json.zst du dataset NikkeTryHard
-    2. Extrait pour chaque partie les features par manche par joueur
-       (identiques a training/game_env.py:_build_features)
-    3. Calcule le rang final de chaque joueur
-    4. Entraine le RewardPredictor GRU en SL (MSE sur la cible rank reward)
-    5. Sauvegarde un checkpoint chargeable avec --warm-start-predictor
+[FORMATS] Chaque partie hanchan produit deux vues: une vue hanchan complete
+et une vue tonpuu limitee a l'Est. Le format est encode dans chaque feature,
+afin que la meme GRU apprenne deux horizons et deux cibles distinctes.
+
+[FIX 2025-XX-2] Loss ponderee : les rewards extremes (±15) pesent 3x plus
+que les rewards moderes (±5).
 
 Usage :
-    python -m mahjong_ai.agents.train_grp_sl --data-dir data/tenhou/2024 --max-files 50000 --epochs 10
-    python -m mahjong_ai.agents.train_grp_sl --data-dir data/tenhou/2024 --max-files 5000 --epochs 5 --output grp_sl.pt
-
-Puis dans training/train.py :
-    --warm-start-predictor grp_sl.pt --no-predictor-retrain
+    python -m mahjong_ai.agents.train_grp_sl --data-dir data/tenhou/2015 --max-files 100000 --epochs 15
 """
 import argparse
 import glob
 import os
 import random
 import time
-from collections import defaultdict
 
 import numpy as np
 import torch
@@ -42,19 +31,20 @@ from mahjong_ai.sl.mjai_parser import parse_mjai_zst_file
 # ====================================================================== #
 # Constantes (identiques a training/game_env.py)
 # ====================================================================== #
-N_ROUNDS_REF = 4             # denominateur de progression (comme game_env.py)
-REWARD_SCALE = 1.0 / 1000.0  # points Tenhou -> unites reward
+N_ROUNDS_REF = 8             # reference hanchan; tonpuu utilise 4
+REWARD_SCALE = 1.0 / 1000.0
 RANK_REWARDS = {1: 15.0, 2: 5.0, 3: -5.0, 4: -15.0}
-MAX_ROUNDS = 16
-MAX_PHYSICAL_ROUNDS = 8           # plafond de padding (au-dela, on tronque)
+MAX_ROUNDS = 12              # E1-S4 + W1-W4 extension
+MAX_PHYSICAL_ROUNDS = 12     # preserve observable extension rounds
+
+EXTREME_REWARD_THRESHOLD = 10.0
+EXTREME_REWARD_WEIGHT = 3.0
 
 
 # ====================================================================== #
-# Extraction des parties depuis les evenements MJAI
+# Extraction
 # ====================================================================== #
 def _rank_from_scores(scores):
-    """Rang 1-4 pour chaque joueur (1 = plus haut score). Egalites tranchees
-    par index de siege (comme game_env._rank_rewards_from_scores)."""
     order = sorted(range(4), key=lambda p: (-scores[p], p))
     ranks = [0] * 4
     for rank, player in enumerate(order, start=1):
@@ -62,31 +52,29 @@ def _rank_from_scores(scores):
     return ranks
 
 
-def extract_games_from_events(events):
-    """Extrait les features par manche pour les 4 joueurs d'une partie.
+def extract_games_from_events(events, game_format="hanchan"):
+    """Extrait les features par manche pour les 4 joueurs.
 
-    Reproduit exactement la logique de training/game_env.py:step() pour
-    construire le vecteur x^k de chaque manche.
-
-    Retourne une liste de tuples (features_par_joueur, reward_final_par_joueur)
-    ou chaque element est :
-        features_par_joueur[p] : np.array (T_p, 8) -- T_p = nb de manches
-        reward_final_par_joueur[p] : float (rank reward final)
-
-    Retourne None si la partie est invalide (pas assez de manches, etc.).
+    Le format determine l'horizon et la cible. Une vue tonpuu d'un hanchan
+    s'arrete a l'entree en Sud; une vue hanchan conserve les manches Sud.
     """
-    # --- Etat courant ---
-    scores = [25000.0] * 4           # points Tenhou absolus
+    if game_format not in ("hanchan", "tonpuu"):
+        raise ValueError(f"format inconnu: {game_format}")
+    normal_rounds = 4 if game_format == "tonpuu" else 8
+    format_flags = (1.0, 0.0) if game_format == "tonpuu" else (0.0, 1.0)
+    scores = [25000.0] * 4
     current_riichi = [False] * 4
     oya = 0
-    round_idx = 0                    # 0-indexe (1ere manche = 0)
+    round_idx = 0
     n_rounds = 0
-
-    # --- Accumulateur de features par joueur ---
+    normal_round_index = 0
+    is_last_normal_round = False
+    is_extension = False
+    honba = 0
+    kyotaku = 0
     feats_by_player = [[] for _ in range(4)]
 
     def _emit_round(deltas, dealer_seat):
-        """Construit les features pour la manche qui vient de se terminer."""
         nonlocal scores, current_riichi, round_idx
         for p in range(4):
             scores[p] += deltas[p]
@@ -97,19 +85,27 @@ def extract_games_from_events(events):
 
         for p in range(4):
             feat = np.array([
-                deltas[p] * REWARD_SCALE,                      # 0: score manche
-                scores[p] * REWARD_SCALE,                      # 1: score cumule
-                1.0 if p == dealer_seat else 0.0,              # 2: dealer
-                min(round_idx + 1, N_ROUNDS_REF) / float(N_ROUNDS_REF),  # 3: progression
-                1.0 if current_riichi[p] else 0.0,             # 4: riichi
-                ranks[p] / 4.0,                                # 5: rang
-                (leader - scores[p]) * REWARD_SCALE,           # 6: gap leader
-                (scores[p] - last) * REWARD_SCALE,             # 7: gap last
+                deltas[p] * REWARD_SCALE,
+                scores[p] * REWARD_SCALE,
+                1.0 if p == dealer_seat else 0.0,
+                min(round_idx + 1, normal_rounds)
+                / float(normal_rounds),
+                1.0 if current_riichi[p] else 0.0,
+                ranks[p] / 4.0,
+                (leader - scores[p]) * REWARD_SCALE,
+                (scores[p] - last) * REWARD_SCALE,
+                format_flags[0],
+                format_flags[1],
+                1.0 if is_last_normal_round else 0.0,
+                1.0 if is_extension else 0.0,
+                min(max(honba, 0), 4) / 4.0,
+                min(max(kyotaku, 0), 4) / 4.0,
+                max(normal_rounds - normal_round_index, 0)
+                / float(normal_rounds),
             ], dtype=np.float32)
             feats_by_player[p].append(feat)
         round_idx += 1
 
-    # --- Parcours des evenements ---
     for ev in events:
         ev_type = ev.get("type")
 
@@ -118,12 +114,25 @@ def extract_games_from_events(events):
             continue
 
         if ev_type == "start_kyoku":
+            if game_format == "tonpuu" and ev.get("bakaze") != "E":
+                break
             if n_rounds >= MAX_PHYSICAL_ROUNDS:
-                break   # on a deja 4 rounds, on ignore la suite (South)
+                break
             s = ev.get("scores")
             if isinstance(s, list) and len(s) == 4:
                 scores = [float(x) for x in s]
             oya = int(ev.get("oya", 0) or 0)
+            kyoku = int(ev.get("kyoku", 1) or 1)
+            if ev.get("bakaze") == "E":
+                normal_round_index = kyoku
+            elif ev.get("bakaze") == "S":
+                normal_round_index = 4 + kyoku
+            else:
+                normal_round_index = 8 + kyoku
+            is_last_normal_round = normal_round_index == normal_rounds
+            is_extension = normal_round_index > normal_rounds
+            honba = int(ev.get("honba", 0) or 0)
+            kyotaku = int(ev.get("kyotaku", 0) or 0)
             current_riichi = [False] * 4
             n_rounds += 1
             continue
@@ -137,17 +146,17 @@ def extract_games_from_events(events):
         if ev_type in ("hora", "ryukyoku"):
             deltas = ev.get("deltas")
             if not (isinstance(deltas, list) and len(deltas) == 4):
-                # Certains fichiers n'ont pas de deltas sur ryukyoku : on met 0
                 deltas = [0] * 4
             _emit_round([float(x) for x in deltas], oya)
             continue
 
-    if n_rounds < 4:
+    if round_idx == 0:
+        return None
+    if game_format == "tonpuu" and round_idx < 4:
         return None
     if any(len(f) == 0 for f in feats_by_player):
         return None
 
-    # --- Reward final de chaque joueur (basé sur le rang final) ---
     final_ranks = _rank_from_scores([float(x) for x in scores])
     rewards_final = [RANK_REWARDS[final_ranks[p]] for p in range(4)]
 
@@ -158,29 +167,27 @@ def extract_games_from_events(events):
 # Dataset PyTorch
 # ====================================================================== #
 class GRPDataset(Dataset):
-    """Dataset de (features, reward_final) pour UN joueur d'UNE partie.
-
-    Pour chaque partie, on cree 4 echantillons (un par joueur), car chaque
-    joueur a sa propre perspective de la meme partie (features differentes
-    car les rangs / dealers / riichi different selon le joueur).
-    """
-
     def __init__(self, data_dir, max_files=None, shuffle_files=True,
                  cache_path=None, max_rounds=MAX_ROUNDS):
         self.max_rounds = max_rounds
-        self.samples = []   # liste de (features (T, 8), reward float)
+        self.samples = []
 
-        # --- Cache : evite de reparser a chaque run ---
         if cache_path and os.path.isfile(cache_path):
             print(f"[dataset] chargement du cache : {cache_path}")
             t0 = time.time()
             data = np.load(cache_path, allow_pickle=True).item()
+            if data.get("feature_dim") != FEATURE_DIM:
+                raise RuntimeError(
+                    f"Cache GRP incompatible: "
+                    f"feature_dim={data.get('feature_dim')}, "
+                    f"attendu={FEATURE_DIM}. Utilisez un nouveau "
+                    "cache-path."
+                )
             self.samples = data["samples"]
             print(f"[dataset] {len(self.samples)} echantillons charges en "
                   f"{time.time()-t0:.1f}s")
             return
 
-        # --- Parse des fichiers ---
         files = sorted(glob.glob(os.path.join(data_dir, "**", "*.zst"),
                                   recursive=True))
         print(f"[dataset] {len(files)} fichiers trouves dans {data_dir}")
@@ -196,36 +203,41 @@ class GRPDataset(Dataset):
         t0 = time.time()
         n_games = 0
         n_failed = 0
-        n_rounds_total = 0
+        n_skipped_incomplete = 0
 
         for i, path in enumerate(files):
             if (i + 1) % max(1, len(files) // 10) == 0:
                 print(f"  ... {i+1}/{len(files)} fichiers  "
-                      f"({n_games} parties, {len(self.samples)} samples) "
+                      f"({n_games} parties, {len(self.samples)} samples, "
+                      f"{n_skipped_incomplete} parties incompletes) "
                       f"[{time.time()-t0:.0f}s]")
             try:
                 events = parse_mjai_zst_file(path)
                 if not events:
                     n_failed += 1
                     continue
-                result = extract_games_from_events(events)
-                if result is None:
+                hanchan_result = extract_games_from_events(
+                    events, game_format="hanchan")
+                tonpuu_result = extract_games_from_events(
+                    events, game_format="tonpuu")
+                if hanchan_result is None and tonpuu_result is None:
+                    n_skipped_incomplete += 1
                     n_failed += 1
                     continue
-                feats_by_player, rewards_final = result
-
-                # Creer 4 echantillons (un par joueur)
-                for p in range(4):
-                    feats = feats_by_player[p]
-                    T = len(feats)
-                    if T == 0:
+                for result in (hanchan_result, tonpuu_result):
+                    if result is None:
                         continue
-                    # Tronque si trop long
-                    if T > self.max_rounds:
-                        feats = feats[:self.max_rounds]
-                        T = self.max_rounds
-                    feat_arr = np.stack(feats, axis=0).astype(np.float32)
-                    self.samples.append((feat_arr, float(rewards_final[p])))
+                    feats_by_player, rewards_final = result
+                    for p in range(4):
+                        feats = feats_by_player[p]
+                        T = len(feats)
+                        if T == 0:
+                            continue
+                        if T > self.max_rounds:
+                            feats = feats[:self.max_rounds]
+                        feat_arr = np.stack(feats, axis=0).astype(np.float32)
+                        self.samples.append(
+                            (feat_arr, float(rewards_final[p])))
                 n_games += 1
             except Exception:
                 n_failed += 1
@@ -233,12 +245,17 @@ class GRPDataset(Dataset):
 
         print(f"[dataset] {len(self.samples)} echantillons charges "
               f"en {time.time()-t0:.1f}s "
-              f"({n_games} parties, {n_failed} echecs)")
+              f"({n_games} parties, "
+              f"{n_skipped_incomplete} parties incompletes, "
+              f"{n_failed} echecs)")
 
-        # --- Sauvegarde du cache ---
         if cache_path:
             print(f"[dataset] sauvegarde du cache -> {cache_path}")
-            np.save(cache_path, {"samples": self.samples}, allow_pickle=True)
+            os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+            np.save(cache_path, {
+                "feature_dim": FEATURE_DIM,
+                "samples": self.samples,
+            }, allow_pickle=True)
 
     def __len__(self):
         return len(self.samples)
@@ -249,7 +266,6 @@ class GRPDataset(Dataset):
 
 
 def make_batch_collate(max_rounds=MAX_ROUNDS):
-    """Collate avec padding dynamique + mask pour la loss."""
     def collate(batch):
         B = len(batch)
         T_max = max(f.shape[0] for f, _ in batch)
@@ -275,7 +291,6 @@ def train_grp(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[grp] device = {device}")
 
-    # --- Dataset ---
     ds = GRPDataset(
         data_dir=args.data_dir,
         max_files=args.max_files,
@@ -284,7 +299,6 @@ def train_grp(args):
     if len(ds) == 0:
         raise RuntimeError("Aucun echantillon extrait.")
 
-    # --- Split train / val (10 % de val) ---
     n_total = len(ds)
     n_val = max(int(n_total * args.val_fraction), 1)
     indices = np.random.RandomState(42).permutation(n_total)
@@ -301,7 +315,6 @@ def train_grp(args):
     val_loader = DataLoader(val_ds, batch_size=args.batch_size,
                              shuffle=False, num_workers=0, collate_fn=collate)
 
-    # --- Modele ---
     model = RewardPredictor(
         input_dim=FEATURE_DIM,
         hidden_dim=args.hidden,
@@ -317,6 +330,11 @@ def train_grp(args):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs * max(len(train_loader), 1))
 
+    def _compute_weight(rewards, preds):
+        w = 1.0 + (EXTREME_REWARD_WEIGHT - 1.0) * \
+            (rewards.abs() > EXTREME_REWARD_THRESHOLD).float()
+        return w.unsqueeze(1).expand_as(preds)
+
     def evaluate(loader):
         model.eval()
         total_loss, total_n = 0.0, 0.0
@@ -325,17 +343,19 @@ def train_grp(args):
                 feats = feats.to(device)
                 rewards = rewards.to(device)
                 masks = masks.to(device)
-                preds = model(feats)                          # (B, T)
-                r_exp = rewards.unsqueeze(1).expand_as(preds) # (B, T)
-                sq = (preds - r_exp) ** 2 * masks             # zero sur padding
+                preds = model(feats)
+                r_exp = rewards.unsqueeze(1).expand_as(preds)
+                weight = _compute_weight(rewards, preds)
+                sq = (preds - r_exp) ** 2 * masks * weight
                 total_loss += sq.sum().item()
-                total_n += masks.sum().item()
+                total_n += (masks * weight).sum().item()
         model.train()
         return total_loss / max(total_n, 1.0)
 
-    # --- Boucle ---
     print(f"[grp] entrainement sur {args.epochs} epoques...")
     best_val = float("inf")
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+
     for epoch in range(args.epochs):
         t0 = time.time()
         total_loss, total_n = 0.0, 0.0
@@ -348,8 +368,10 @@ def train_grp(args):
 
             preds = model(feats)
             r_exp = rewards.unsqueeze(1).expand_as(preds)
-            sq = (preds - r_exp) ** 2 * masks
-            loss = sq.sum() / masks.sum().clamp(min=1.0)
+
+            weight = _compute_weight(rewards, preds)
+            sq = (preds - r_exp) ** 2 * masks * weight
+            loss = sq.sum() / (masks * weight).sum().clamp(min=1.0)
 
             optimizer.zero_grad()
             loss.backward()
@@ -358,13 +380,12 @@ def train_grp(args):
             scheduler.step()
 
             total_loss += sq.sum().item()
-            total_n += masks.sum().item()
+            total_n += (masks * weight).sum().item()
             n_batches += 1
 
         train_loss = total_loss / max(total_n, 1.0)
         val_loss = evaluate(val_loader)
 
-        # Metrique R^2 (sur la variance des rank_rewards)
         var_rank = float(np.var(list(RANK_REWARDS.values())))
         r2 = 1.0 - val_loss / var_rank
 
@@ -384,21 +405,14 @@ def train_grp(args):
     print(f"[grp] checkpoint : {args.output}")
 
 
-# ====================================================================== #
-# Main
-# ====================================================================== #
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--data-dir", type=str, required=True,
-                   help="dossier racine des fichiers .mjai.json.zst")
-    p.add_argument("--max-files", type=int, default=None,
-                   help="limiter le nombre de fichiers a parser")
-    p.add_argument("--cache-path", type=str, default="grp_dataset_cache.npy",
-                   help="cache .npy des echantillons (evite le re-parse)")
-    p.add_argument("--output", type=str, default="grp_sl.pt",
-                   help="chemin de sauvegarde du modele")
-    p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--data-dir", type=str, required=True)
+    p.add_argument("--max-files", type=int, default=None)
+    p.add_argument("--cache-path", type=str, default="grp_dataset_cache.npy")
+    p.add_argument("--output", type=str, default="grp_sl.pt")
+    p.add_argument("--batch-size", type=int, default=512)
+    p.add_argument("--epochs", type=int, default=15)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--hidden", type=int, default=128)
     p.add_argument("--layers", type=int, default=2)

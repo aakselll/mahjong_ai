@@ -53,12 +53,14 @@ CHANNEL_GROUPS = [
     ('dora_ind', 1), ('dora_tile', 1), ('pending', 1), ('unseen', 1),
     ('own_riichi', 1), ('opp_riichi', 3), ('own_furiten', 1),
     ('seat_wind', 4), ('round_wind', 4), ('dealer', 1), ('round_id', 4),
+    ('game_format', 2), ('is_last_normal_round', 1), ('is_extension', 1),
+    ('extension_index', 8), ('round_progress', 10),
     ('honba', 5), ('kyoutaku', 5),
     ('own_score', 20), ('opp0_score', 20), ('opp1_score', 20), ('opp2_score', 20),
     ('wall_remaining', 10),
     ('lookahead', LOOKAHEAD_CHANNELS),
 ]
-N_CHANNELS = sum(n for _, n in CHANNEL_GROUPS)     # 250
+N_CHANNELS = sum(n for _, n in CHANNEL_GROUPS)
 OBS_FLAT_DIM = N_CHANNELS * N_TILES                # 8500
 
 _OFFSET = {}
@@ -358,7 +360,10 @@ def build_suphx_obs(*, hands, melds, discards, discard_hist,
                      riichi_flags, furiten_flag, dora_indicators,
                      wall_remaining, scores, dealer_seat, round_wind,
                      round_id, honba, kyoutaku, seat, pending_claim_tile=None,
-                     compute_lookahead_flag=True):
+                     compute_lookahead_flag=True, game_format='hanchan',
+                     is_last_normal_round=False, is_extension=False,
+                     extension_index=0, normal_round_count=None,
+                     round_progress=None):
     C = np.zeros((N_CHANNELS, N_TILES), dtype=np.float32)
 
     def block(name):
@@ -459,6 +464,23 @@ def build_suphx_obs(*, hands, melds, discards, discard_hist,
     o = block('round_id')
     for k in range(4):
         C[o + k] = 1.0 if k == (round_id - 1) else 0.0
+
+    if game_format not in ('tonpuu', 'hanchan'):
+        raise ValueError(f'unknown game_format: {game_format}')
+    o = block('game_format')
+    C[o + (0 if game_format == 'tonpuu' else 1)] = 1.0
+    C[block('is_last_normal_round')] = 1.0 if is_last_normal_round else 0.0
+    C[block('is_extension')] = 1.0 if is_extension else 0.0
+    C[block('extension_index') + min(max(int(extension_index), 0), 7)] = 1.0
+    if normal_round_count is None:
+        normal_round_count = 4 if game_format == 'tonpuu' else 8
+    if round_progress is None:
+        round_progress = round_id
+    progress = min(max(int(round_progress), 1), int(normal_round_count))
+    progress_bucket = min(
+        int((progress - 1) * 10 / max(int(normal_round_count), 1)), 9
+    )
+    C[block('round_progress') + progress_bucket] = 1.0
 
     C[block('honba') + min(int(honba), 4)] = 1.0
     C[block('kyoutaku') + min(int(kyoutaku), 4)] = 1.0

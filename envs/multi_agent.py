@@ -599,7 +599,12 @@ class MultiAgentMahjongEnv:
         """Retourne (N_CHANNELS, 34) float32 via envs.suphx_features."""
         scores = list(self.ctx.get("scores", [0.0] * 4))
         round_wind = int(self.ctx.get("round_wind_idx", 0))
-        round_id = (int(self.ctx.get("round_idx", 0)) % 4) + 1
+        round_index = int(self.ctx.get("round_idx", 0))
+        round_id = (round_index % 4) + 1
+        normal_round_count = 4
+        is_extension = round_index >= normal_round_count
+        extension_index = max(0, round_index - normal_round_count + 1)
+        is_last_normal_round = round_index == normal_round_count - 1
 
         obs = build_suphx_obs(
             hands=self.hands,
@@ -619,6 +624,12 @@ class MultiAgentMahjongEnv:
             kyoutaku=self.riichi_deposits,
             seat=seat,
             pending_claim_tile=pending_claim_tile,
+            game_format="tonpuu",
+            is_last_normal_round=is_last_normal_round,
+            is_extension=is_extension,
+            extension_index=extension_index,
+            normal_round_count=normal_round_count,
+            round_progress=round_index + 1,
 
         )
         self._pending_oracle = self._build_oracle(seat)
