@@ -91,6 +91,7 @@ def _round_context(event, game_format):
         "is_extension": absolute_round > normal_round_count,
         "extension_index": max(0, absolute_round - normal_round_count),
         "round_progress": absolute_round,
+        "rounds_remaining": max(normal_round_count - absolute_round, 0),
     }
 
 

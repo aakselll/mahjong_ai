@@ -54,7 +54,7 @@ CHANNEL_GROUPS = [
     ('own_riichi', 1), ('opp_riichi', 3), ('own_furiten', 1),
     ('seat_wind', 4), ('round_wind', 4), ('dealer', 1), ('round_id', 4),
     ('game_format', 2), ('is_last_normal_round', 1), ('is_extension', 1),
-    ('extension_index', 8), ('round_progress', 10),
+    ('extension_index', 8), ('round_progress', 10), ('rounds_remaining', 10),
     ('honba', 5), ('kyoutaku', 5),
     ('own_score', 20), ('opp0_score', 20), ('opp1_score', 20), ('opp2_score', 20),
     ('wall_remaining', 10),
@@ -363,7 +363,7 @@ def build_suphx_obs(*, hands, melds, discards, discard_hist,
                      compute_lookahead_flag=True, game_format='hanchan',
                      is_last_normal_round=False, is_extension=False,
                      extension_index=0, normal_round_count=None,
-                     round_progress=None):
+                     round_progress=None, rounds_remaining=None):
     C = np.zeros((N_CHANNELS, N_TILES), dtype=np.float32)
 
     def block(name):
@@ -481,6 +481,14 @@ def build_suphx_obs(*, hands, melds, discards, discard_hist,
         int((progress - 1) * 10 / max(int(normal_round_count), 1)), 9
     )
     C[block('round_progress') + progress_bucket] = 1.0
+    if rounds_remaining is None:
+        rounds_remaining = max(int(normal_round_count) - progress, 0)
+    remaining_bucket = min(
+        int(max(int(rounds_remaining), 0) * 10
+            / max(int(normal_round_count), 1)),
+        9,
+    )
+    C[block('rounds_remaining') + remaining_bucket] = 1.0
 
     C[block('honba') + min(int(honba), 4)] = 1.0
     C[block('kyoutaku') + min(int(kyoutaku), 4)] = 1.0

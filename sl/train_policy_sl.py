@@ -34,10 +34,11 @@ from collections import Counter
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler, Subset
 
 from mahjong_ai.sl.dataset import PolicyDataset, discover_files
 from mahjong_ai.agents.suphx_cnn import build_model, N_CHANNELS
+from mahjong_ai.envs.suphx_features import _OFFSET
 
 
 # Tete(s) pour laquelle/lesquelles on utilise la weighted loss.
@@ -71,6 +72,40 @@ def evaluate(model, loader, device, class_weights=None):
     return total_loss / max(n, 1), correct / max(n, 1)
 
 
+def _format_indices(dataset):
+    """Retourne les indices des vues tonpuu et hanchan dans un dataset."""
+    format_channel = _OFFSET['game_format']
+    tonpuu, hanchan = [], []
+    for index, sample in enumerate(dataset.samples):
+        obs = sample[0]
+        if obs[format_channel, 0] > obs[format_channel + 1, 0]:
+            tonpuu.append(index)
+        else:
+            hanchan.append(index)
+    return tonpuu, hanchan
+
+
+def _balanced_sampler(dataset, indices):
+    """Echantillonne a parts egales les deux horizons pour --game-format both."""
+    format_channel = _OFFSET['game_format']
+    counts = [0, 0]
+    labels = []
+    for index in indices:
+        obs = dataset.samples[index][0]
+        format_id = 0 if obs[format_channel, 0] > obs[format_channel + 1, 0] else 1
+        labels.append(format_id)
+        counts[format_id] += 1
+    weights = [
+        1.0 / max(counts[format_id], 1)
+        for format_id in labels
+    ]
+    return WeightedRandomSampler(
+        torch.as_tensor(weights, dtype=torch.double),
+        num_samples=len(indices),
+        replacement=True,
+    )
+
+
 def compute_class_weights(train_ds, ds, n_classes, device, head_type):
     """Ponderation par l'inverse de la frequence, UNIQUEMENT pour les tetes
     listees dans WEIGHTED_LOSS_HEADS. Retourne None sinon (loss standard).
@@ -101,8 +136,11 @@ def train(args):
     files = discover_files(args.data_dir, max_files=args.max_files)
     cache = None
     if args.cache_dir:
-        os.makedirs(args.cache_dir, exist_ok=True)
-        cache = os.path.join(args.cache_dir, 'samples_all.pkl')
+        format_cache_dir = os.path.join(
+            args.cache_dir, f'format_{args.game_format}'
+        )
+        os.makedirs(format_cache_dir, exist_ok=True)
+        cache = os.path.join(format_cache_dir, 'samples_all.pkl')
 
     ds = PolicyDataset(
         files, args.head, cache_path=cache, verbose=True,
@@ -114,6 +152,10 @@ def train(args):
 
     train_ds, val_ds = ds.make_subsets(val_fraction=args.val_fraction)
     print(f'[train/{args.head}] train={len(train_ds)}  val={len(val_ds)}',
+          flush=True)
+    train_tonpuu, train_hanchan = _format_indices(ds)
+    print(f'[train/{args.head}] format total: '
+          f'tonpuu={len(train_tonpuu)} hanchan={len(train_hanchan)}',
           flush=True)
 
     # ---------------- Nombre de classes ----------------
@@ -144,8 +186,16 @@ def train(args):
 
     # ---------------- DataLoaders ----------------
     pin = (device == 'cuda')
+    sampler = None
+    shuffle = True
+    if args.game_format == 'both':
+        sampler = _balanced_sampler(ds, train_ds.indices)
+        shuffle = False
+        print(f'[train/{args.head}] sampler format equilibre 50/50',
+              flush=True)
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
+        train_ds, batch_size=args.batch_size, shuffle=shuffle,
+        sampler=sampler,
         num_workers=args.num_workers, collate_fn=make_collate(),
         pin_memory=pin, drop_last=True,
     )
@@ -154,6 +204,16 @@ def train(args):
         num_workers=args.num_workers, collate_fn=make_collate(),
         pin_memory=pin,
     )
+    val_tonpuu = [i for i in val_ds.indices if i in train_tonpuu]
+    val_hanchan = [i for i in val_ds.indices if i in train_hanchan]
+    val_format_loaders = {}
+    for name, indices in (('tonpuu', val_tonpuu), ('hanchan', val_hanchan)):
+        if indices:
+            val_format_loaders[name] = DataLoader(
+                Subset(ds, indices), batch_size=args.batch_size,
+                shuffle=False, num_workers=args.num_workers,
+                collate_fn=make_collate(), pin_memory=pin,
+            )
 
     # ---------------- Modele ----------------
     model = build_model(
@@ -241,11 +301,18 @@ def train(args):
         tr_acc = correct / max(n, 1)
         va_loss, va_acc = evaluate(model, val_loader, device,
                                     class_weights=class_weights)
+        format_metrics = []
+        for format_name, format_loader in val_format_loaders.items():
+            _, format_acc = evaluate(
+                model, format_loader, device, class_weights=class_weights
+            )
+            format_metrics.append(f'{format_name}_acc={format_acc:.4f}')
         dt = time.time() - t0
 
         print(f'[epoch {epoch+1:2d}/{args.epochs}] '
               f'train_loss={tr_loss:.4f} train_acc={tr_acc:.4f}  '
-              f'val_loss={va_loss:.4f} val_acc={va_acc:.4f}  ({dt:.1f}s)',
+              f'val_loss={va_loss:.4f} val_acc={va_acc:.4f} '
+              f'{" ".join(format_metrics)} ({dt:.1f}s)',
               flush=True)
 
         if va_acc > best_val_acc:
@@ -279,8 +346,8 @@ def main():
     p.add_argument('--max-files', type=int, default=None)
     p.add_argument('--game-format',
                    choices=['hanchan', 'tonpuu', 'both'],
-                   default='hanchan',
-                   help='horizon features a entrainer (defaut: hanchan)')
+                   default='both',
+                   help='horizons a entrainer (defaut: both)')
     p.add_argument('--output', required=True)
 
     # Warm-start : charge un checkpoint existant de la MEME tete.

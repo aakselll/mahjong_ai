@@ -605,6 +605,7 @@ class MultiAgentMahjongEnv:
         is_extension = round_index >= normal_round_count
         extension_index = max(0, round_index - normal_round_count + 1)
         is_last_normal_round = round_index == normal_round_count - 1
+        rounds_remaining = max(normal_round_count - (round_index + 1), 0)
 
         obs = build_suphx_obs(
             hands=self.hands,
@@ -630,6 +631,7 @@ class MultiAgentMahjongEnv:
             extension_index=extension_index,
             normal_round_count=normal_round_count,
             round_progress=round_index + 1,
+            rounds_remaining=rounds_remaining,
 
         )
         self._pending_oracle = self._build_oracle(seat)
