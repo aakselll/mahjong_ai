@@ -1,20 +1,22 @@
 """
 Features d'entree Suphx (papier §2.2). Module partage parser <-> env.
-
 Layout : (N_CHANNELS, 34).
 Look-ahead : 80 canaux (4 n_replace x 20 score_buckets), valeurs booleennes,
 melds pris en compte dans le DFS et le scoring.
 
+[MODIF 2026-10-13] Suppression game_format et round_progress des canaux.
+rounds_remaining devient ABSOLU (0-7, one-hot) pour permettre le transfert
+hanchan/tonpusen : E4-tonpusen et S4-hanchan partagent le bucket 0.
+
 [OPTIM 2025-XX] Separation en 2 caches distincts :
-  - _enumerate_hands_cached : DFS pur, depend de (H_prime, melds, max_add)
-  - _score_with_dora_cached : scoring, depend de (T, melds, sw, rw, dl, dora)
-  La meme main gagnante T peut etre atteinte depuis plusieurs tuiles
-  discardables differentes -> le cache scoring a un hit rate eleve (>60%
-  observe). Ajout d'un cache HandConfig par (seat_wind, round_wind).
-  Gain mesure : ~3-5x sur le look-ahead, aucun changement de signal.
+- _enumerate_hands_cached : DFS pur, depend de (H_prime, melds, max_add)
+- _score_with_dora_cached : scoring, depend de (T, melds, sw, rw, dl, dora)
+La meme main gagnante T peut etre atteinte depuis plusieurs tuiles
+discardables differentes -> le cache scoring a un hit rate eleve (>60%
+observe). Ajout d'un cache HandConfig par (seat_wind, round_wind).
+Gain mesure : ~3-5x sur le look-ahead, aucun changement de signal.
 """
 import functools
-
 import numpy as np
 from mahjong.constants import EAST, SOUTH, WEST, NORTH
 from mahjong.hand_calculating.hand import HandCalculator
@@ -32,14 +34,13 @@ _MELD_TYPE_MAP = {
     'shouminkan': Meld.SHOUMINKAN,
 }
 
+# ====================================================================== #
+# Layout des canaux  [MODIFIE]
+# ====================================================================== #
 
-# ====================================================================== #
-# Layout des canaux
-# ====================================================================== #
 N_REPLACE_VALUES = (1, 2, 3, 4)
 N_SCORE_BUCKETS = 20
 LOOKAHEAD_CHANNELS = len(N_REPLACE_VALUES) * N_SCORE_BUCKETS   # 80
-
 MAX_DFS_RESULTS = 30
 MAX_LOOKAHEAD_SHANTEN = 2
 
@@ -53,15 +54,19 @@ CHANNEL_GROUPS = [
     ('dora_ind', 1), ('dora_tile', 1), ('pending', 1), ('unseen', 1),
     ('own_riichi', 1), ('opp_riichi', 3), ('own_furiten', 1),
     ('seat_wind', 4), ('round_wind', 4), ('dealer', 1), ('round_id', 4),
-    ('game_format', 2), ('is_last_normal_round', 1), ('is_extension', 1),
-    ('extension_index', 8), ('round_progress', 10), ('rounds_remaining', 10),
+    # [SUPPRIME] ('game_format', 2),
+    # [SUPPRIME] ('round_progress', 10),
+    ('is_last_normal_round', 1), ('is_extension', 1),
+    ('extension_index', 8),
+    ('rounds_remaining', 8),   # [MODIFIE] absolu 0-7, one-hot
     ('honba', 5), ('kyoutaku', 5),
     ('own_score', 20), ('opp0_score', 20), ('opp1_score', 20), ('opp2_score', 20),
     ('wall_remaining', 10),
     ('lookahead', LOOKAHEAD_CHANNELS),
 ]
+
 N_CHANNELS = sum(n for _, n in CHANNEL_GROUPS)
-OBS_FLAT_DIM = N_CHANNELS * N_TILES                # 8500
+OBS_FLAT_DIM = N_CHANNELS * N_TILES
 
 _OFFSET = {}
 _o = 0
@@ -69,13 +74,12 @@ for _name, _n in CHANNEL_GROUPS:
     _OFFSET[_name] = _o
     _o += _n
 
-
 # ====================================================================== #
 # HandConfig cache (immutable, safe to reuse)
 # ====================================================================== #
+
 _CONFIG_CACHE = {}
 _OPTIONS = OptionalRules(has_open_tanyao=True, has_aka_dora=False)
-
 
 def _get_config(seat_wind, round_wind):
     key = (seat_wind, round_wind)
@@ -90,10 +94,10 @@ def _get_config(seat_wind, round_wind):
         _CONFIG_CACHE[key] = cfg
     return cfg
 
-
 # ====================================================================== #
 # Look-ahead : DFS + scoring
 # ====================================================================== #
+
 _SCORE_UPPER = [
     0, 1000, 1500, 2000, 2500, 3000, 4000, 5000, 6000, 8000,
     10000, 12000, 16000, 20000, 24000, 32000, 48000, 64000, 96000, 10**9,
@@ -109,7 +113,6 @@ for _suit in range(3):
 
 _HAND_CALC = HandCalculator()
 
-
 def _score_to_bucket(score):
     if score is None or score <= 0:
         return 0
@@ -118,10 +121,8 @@ def _score_to_bucket(score):
             return max(i, 1)
     return N_SCORE_BUCKETS - 1
 
-
 def _meld_add_cost(hand, meld_counts):
     return sum(max(0, need - hand[t]) for t, need in meld_counts.items())
-
 
 def _consume(hand, meld_counts):
     new = hand.copy()
@@ -129,17 +130,14 @@ def _consume(hand, meld_counts):
         new[t] = max(0, new[t] - need)
     return new
 
-
 def _enumerate_winning_hands_with_melds(hand13, existing_melds, max_add,
-                                          max_results=MAX_DFS_RESULTS):
+                                        max_results=MAX_DFS_RESULTS):
     base = np.zeros(N_TILES, dtype=np.int32)
     for m in existing_melds:
         for t in m['tiles']:
             base[t] += 1
-
     n_melds_needed = max(0, 4 - len(existing_melds))
     remaining = hand13.copy()
-
     counter = [0]
     visited = [0]
     MAX_VISITED = 300
@@ -151,228 +149,168 @@ def _enumerate_winning_hands_with_melds(hand13, existing_melds, max_add,
         if adds > max_add:
             return
         if melds_left == 0:
-            for t in range(N_TILES):
-                pair_add = max(0, 2 - hand[t])
-                if adds + pair_add <= max_add:
-                    T = base.copy()
-                    for md in chosen:
-                        for tt, need in md.items():
-                            T[tt] += need
-                    T[t] += 2
-                    counter[0] += 1
-                    yield T, adds + pair_add
-                    if counter[0] >= max_results or visited[0] >= MAX_VISITED:
-                        return
+            if sum(remaining) == 0:
+                counter[0] += 1
+                yield tuple(base + hand)
             return
-        for md in _MELD_OPTIONS:
-            if counter[0] >= max_results or visited[0] >= MAX_VISITED:
-                return
-            md_add = _meld_add_cost(hand, md)
-            if adds + md_add > max_add:
+        for meld_counts in _MELD_OPTIONS:
+            cost = _meld_add_cost(remaining, meld_counts)
+            if cost > adds:
                 continue
-            if adds > 2 and not any(hand[t] > 0 for t in md):
+            new_remaining = _consume(remaining, meld_counts)
+            if sum(new_remaining) + 3 * (melds_left - 1) < 0:
                 continue
-            yield from dfs(_consume(hand, md), melds_left - 1,
-                            adds + md_add, chosen + [md])
+            old_remaining = remaining
+            remaining = new_remaining
+            yield from dfs(hand, melds_left - 1,
+                           adds - cost, chosen + [meld_counts])
+            remaining = old_remaining
 
     yield from dfs(remaining, n_melds_needed, 0, [])
-
+    return
 
 def _score_winning_hand_with_melds(T_full, existing_melds, seat_wind,
-                                     round_wind, is_dealer, dora_indicators):
-    if int(np.sum(T_full)) != 14:
-        return None
-
-    tiles_136 = []
-    nid = [0] * N_TILES
-    T = T_full.copy()
-    meld_objs = []
-
+                                    round_wind, is_dealer, dora_indicators):
+    melds = []
     for m in existing_melds:
-        tile_ids = []
-        for t in m['tiles']:
-            if t < 0 or t >= N_TILES or T[t] <= 0:
-                return None
-            tid = 4 * t + nid[t]
-            nid[t] += 1
-            T[t] -= 1
-            tiles_136.append(tid)
-            tile_ids.append(tid)
-        mt = _MELD_TYPE_MAP.get(m['type'])
-        if mt is None:
-            return None
-        opened = (m['type'] != 'kan_closed')
-        meld_objs.append(Meld(meld_type=mt, tiles=tile_ids, opened=opened))
+        meld = Meld()
+        meld.tiles = [int(t) for t in m['tiles']]
+        meld.type = _MELD_TYPE_MAP.get(m['type'], Meld.PON)
+        melds.append(meld)
 
-    for t in range(N_TILES):
-        for _ in range(int(T[t])):
-            tid = 4 * t + nid[t]
-            nid[t] += 1
-            tiles_136.append(tid)
-
-    if len(tiles_136) != 14:
+    config = _get_config(seat_wind, round_wind)
+    config.is_dealer = is_dealer
+    win_result = _HAND_CALC.estimate_hand_value(
+        tiles=[int(t) for t in T_full],
+        win_tile=int(T_full[-1]) if len(T_full) > 0 else 0,
+        melds=melds,
+        dora_indicators=[int(d) for d in dora_indicators],
+        config=config,
+    )
+    if win_result is None:
         return None
-    win_tile_136 = tiles_136[-1]
+    return win_result
 
-    dora_136 = [t * 4 for t in dora_indicators if 0 <= t < N_TILES]
-    try:
-        res = _HAND_CALC.estimate_hand_value(
-            tiles_136, win_tile_136, melds=meld_objs,
-            dora_indicators=dora_136,
-            config=_get_config(seat_wind, round_wind),
-        )
-        if res.error is not None:
-            return None
-        base = int(res.cost.get('main', 0)) if isinstance(res.cost, dict) else int(res.cost)
-        return int(base * 1.5) if is_dealer else base
-    except Exception:
-        return None
-
-
-def _melds_cache_key(melds):
-    return tuple(sorted(
-        (str(m['type']), tuple(sorted(int(t) for t in m['tiles'])))
-        for m in melds
-    ))
-
-
-# ---------------------------------------------------------------------- #
-# Cache 1 : DFS pur, independant du dora et du wind
-# ---------------------------------------------------------------------- #
-@functools.lru_cache(maxsize=512)
+@functools.lru_cache(maxsize=200_000)
 def _enumerate_hands_cached(hand_tuple, melds_key, max_add):
-    """DFS seulement. Retourne tuple de (T_tuple, n_add).
-    Independant de dora/winds -> cache plus efficace."""
-    hand = np.array(hand_tuple, dtype=np.int32)
-    melds = [{'type': k[0], 'tiles': list(k[1])} for k in melds_key]
-    out = []
-    for T, n_add in _enumerate_winning_hands_with_melds(hand, melds, max_add):
-        if n_add < 1 or n_add > len(N_REPLACE_VALUES):
-            continue
-        out.append((tuple(int(x) for x in T.tolist()), int(n_add)))
-    return tuple(out)
-
-
-# ---------------------------------------------------------------------- #
-# Cache 2 : scoring, independant de H_prime (donc partage entre discards)
-# ---------------------------------------------------------------------- #
-@functools.lru_cache(maxsize=8192)
-def _score_with_dora_cached(T_tuple, melds_key, seat_wind, round_wind,
-                              is_dealer, dora_tuple):
-    """Score d'une main gagnante T. Le T est identique pour plusieurs
-    discards -> hit rate eleve."""
-    T = np.array(T_tuple, dtype=np.int32)
-    melds = [{'type': k[0], 'tiles': list(k[1])} for k in melds_key]
-    return _score_winning_hand_with_melds(
-        T, melds, seat_wind, round_wind, is_dealer, list(dora_tuple))
-
+    hand13 = np.array(hand_tuple, dtype=np.int32)
+    existing_melds = []
+    if melds_key:
+        for m_str in melds_key:
+            import json
+            existing_melds.append(json.loads(m_str))
+    results = list(_enumerate_winning_hands_with_melds(
+        hand13, existing_melds, max_add))
+    return results
 
 def compute_lookahead(hand13_counts, melds, seat_wind, round_wind,
-                       is_dealer, dora_indicators, unseen=None, wall_remaining=None):
+                      is_dealer, dora_indicators, unseen=None,
+                      wall_remaining=None):
     """Look-ahead binaire (papier §2.2). 0/1 dans (n_replace, score_bucket)."""
     features = np.zeros((LOOKAHEAD_CHANNELS, N_TILES), dtype=np.float32)
 
-    if wall_remaining is not None and wall_remaining <= 0:
+    try:
+        from mahjong.shanten import Shanten
+        shanten = Shanten().calculate_shanten(
+            list(hand13_counts), use_chiitoitsu=True)
+    except Exception:
         return features
 
-    hand = np.asarray(hand13_counts, dtype=np.int32)
+    if shanten > MAX_LOOKAHEAD_SHANTEN:
+        return features
 
-    # ---- Skip si trop loin du tenpai ----
-    try:
-        from mahjong_ai.envs.tiles import shanten_of
-        melds_counts = np.zeros(N_TILES, dtype=np.int32)
-        for m in melds:
-            if m['type'] in ('kan_closed', 'shouminkan', 'kan_open'):
-                melds_counts[m['tiles'][0]] += 3
-            else:
-                for t in m['tiles']:
-                    melds_counts[t] += 1
-        full = hand + melds_counts
-        sh = shanten_of(full.tolist())
-        if sh < 0 or sh > MAX_LOOKAHEAD_SHANTEN:
-            return features
-    except Exception:
-        pass
+    import json
+    melds_key = tuple(json.dumps(m, sort_keys=True) for m in melds)
+    hand_tuple = tuple(int(x) for x in hand13_counts)
 
-    dora_t = tuple(sorted(int(x) for x in dora_indicators if 0 <= x < N_TILES))
-    melds_key = _melds_cache_key(melds)
-    sw, rw, dl = int(seat_wind), int(round_wind), bool(is_dealer)
-    max_add = max(N_REPLACE_VALUES)
-
-    for d in range(N_TILES):
-        if hand[d] == 0:
+    for n_replace in N_REPLACE_VALUES:
+        max_add = n_replace * 2
+        try:
+            winning_hands = _enumerate_hands_cached(
+                hand_tuple, melds_key, max_add)
+        except Exception:
             continue
-        H_prime = hand.copy()
-        H_prime[d] -= 1
-        H_prime_tuple = tuple(int(x) for x in H_prime.tolist())
 
-        # DFS (cache par H_prime + melds)
-        dfs_results = _enumerate_hands_cached(H_prime_tuple, melds_key, max_add)
+        if not winning_hands:
+            continue
 
-        # Scoring (cache par T + melds + winds + dora -> hits elevees)
-        for T_t, n_add in dfs_results:
-            score = _score_with_dora_cached(
-                T_t, melds_key, sw, rw, dl, dora_t)
-            if score is None:
+        for T_full in winning_hands[:MAX_DFS_RESULTS]:
+            try:
+                result = _score_winning_hand_with_melds(
+                    np.array(T_full, dtype=np.int32),
+                    melds, seat_wind, round_wind, is_dealer,
+                    dora_indicators)
+            except Exception:
                 continue
-            bucket = _score_to_bucket(score)
-            features[(n_add - 1) * N_SCORE_BUCKETS + bucket][d] = 1.0
+            if result is None or result.han <= 0:
+                continue
+            score_bucket = _score_to_bucket(result.cost['total'] if result.cost else 0)
+            channel = (n_replace - 1) * N_SCORE_BUCKETS + score_bucket
+            features[channel] = 1.0
 
     return features
 
+def _next_dora(ind):
+    if ind < 27:
+        return (ind // 9) * 9 + (ind % 9 + 1) % 9
+    if ind < 31:
+        return 27 + (ind - 27 + 1) % 4
+    return 31 + (ind - 31 + 1) % 3
 
 # ====================================================================== #
-# Bucketing
+# Score bucketing
 # ====================================================================== #
-_SCORE_LOW, _SCORE_HIGH = -30.0, 30.0
-_SCORE_BUCKETS = 20
 
+_SCORES_UPPER = [
+    -10**9, 0, 1000, 2000, 3000, 4000, 5000, 6000, 8000, 10000,
+    12000, 16000, 20000, 24000, 28000, 32000, 36000, 40000, 48000, 10**9,
+]
 
 def _score_bucket(score_k):
-    if score_k <= _SCORE_LOW:
-        return 0
-    if score_k >= _SCORE_HIGH:
-        return _SCORE_BUCKETS - 1
-    frac = (score_k - _SCORE_LOW) / (_SCORE_HIGH - _SCORE_LOW)
-    return min(int(frac * _SCORE_BUCKETS), _SCORE_BUCKETS - 1)
-
+    """score_k : score en milliers (score - 25000) / 1000."""
+    for i, upper in enumerate(_SCORES_UPPER):
+        if score_k <= upper:
+            return max(i, 1)
+    return len(_SCORES_UPPER) - 1
 
 def _wall_bucket(wall_remaining):
     wr = min(max(wall_remaining, 0), 70)
     return min(int(wr / 70.0 * 10), 9)
 
-
-def _next_dora(ind):
-    if ind < 0 or ind >= N_TILES:
-        return -1
-    if ind < 27:
-        s = (ind // 9) * 9
-        return s + (ind % 9 + 1) % 9
-    if ind < 31:
-        return 27 + (ind - 27 + 1) % 4
-    return 31 + (ind - 31 + 1) % 3
-
-
 # ====================================================================== #
-# Builder principal
+# Builder principal  [MODIFIE]
 # ====================================================================== #
+
 def build_suphx_obs(*, hands, melds, discards, discard_hist,
-                     riichi_flags, furiten_flag, dora_indicators,
-                     wall_remaining, scores, dealer_seat, round_wind,
-                     round_id, honba, kyoutaku, seat, pending_claim_tile=None,
-                     compute_lookahead_flag=True, game_format='hanchan',
-                     is_last_normal_round=False, is_extension=False,
-                     extension_index=0, normal_round_count=None,
-                     round_progress=None, rounds_remaining=None):
-    C = np.zeros((N_CHANNELS, N_TILES), dtype=np.float32)
+                    riichi_flags, furiten_flag, dora_indicators,
+                    wall_remaining, scores, dealer_seat, round_wind,
+                    round_id, honba, kyoutaku, seat,
+                    pending_claim_tile=None,
+                    compute_lookahead_flag=True,
+                    is_last_normal_round=False, is_extension=False,
+                    extension_index=0, normal_round_count=None,
+                    rounds_remaining=None):
+    """
+    Construit l'observation (N_CHANNELS, 34) float32.
 
+    rounds_remaining : int, nombre ABSOLU de manches normales restantes.
+      - hanchan E1=7, E2=6, E3=5, E4=4, S1=3, S2=2, S3=1, S4=0
+      - tonpusen E1=3, E2=2, E3=1, E4=0
+      - extension (enchousen/Ouest) : toujours 0
+    Si None, derive depuis normal_round_count et round_id.
+
+    [SUPPRIME] game_format et round_progress.
+    """
+    C = np.zeros((N_CHANNELS, N_TILES), dtype=np.float32)
     def block(name):
         return _OFFSET[name]
 
+    # --- Main propre ---
     o = block('own_hand')
     for n in range(4):
         C[o + n] = (hands[seat] >= (n + 1)).astype(np.float32)
 
+    # --- Melds propres ---
     own_open = np.zeros(N_TILES, dtype=np.int32)
     own_ankan = np.zeros(N_TILES, dtype=np.int32)
     for m in melds[seat]:
@@ -390,11 +328,13 @@ def build_suphx_obs(*, hands, melds, discards, discard_hist,
     for n in range(4):
         C[o + n] = (own_ankan >= (n + 1)).astype(np.float32)
 
+    # --- Discards par siege ---
     for s in range(4):
         o = block(f'discards_s{s}')
         for n in range(4):
             C[o + n] = (discards[s] >= (n + 1)).astype(np.float32)
 
+    # --- Dernier discard + tsumogiri par siege ---
     for s in range(4):
         hist = discard_hist[s] if discard_hist is not None and s < len(discard_hist) else []
         if hist:
@@ -407,6 +347,7 @@ def build_suphx_obs(*, hands, melds, discards, discard_hist,
                 tg[tile] += 1.0
         C[block(f'tsumogiri_s{s}')] = tg
 
+    # --- Melds adversaires ---
     opps = [(seat + 1) % 4, (seat + 2) % 4, (seat + 3) % 4]
     for i, opp in enumerate(opps):
         opp_meld = np.zeros(N_TILES, dtype=np.int32)
@@ -420,6 +361,7 @@ def build_suphx_obs(*, hands, melds, discards, discard_hist,
         for n in range(4):
             C[o + n] = (opp_meld >= (n + 1)).astype(np.float32)
 
+    # --- Dora ---
     o = block('dora_ind')
     for ind in dora_indicators:
         if 0 <= ind < N_TILES:
@@ -430,29 +372,35 @@ def build_suphx_obs(*, hands, melds, discards, discard_hist,
         if 0 <= dt < N_TILES:
             C[o][dt] += 1.0
 
+    # --- Tuile en attente d'appel ---
     if pending_claim_tile is not None and 0 <= pending_claim_tile < N_TILES:
         C[block('pending')][pending_claim_tile] = 1.0
 
+    # --- Tuiles non vues ---
     seen = hands[seat].astype(np.int32).copy()
     for s in range(4):
         for m in melds[s]:
             for t in m['tiles']:
                 seen[t] += 1
-        seen += discards[s]
+    seen += discards[s]
     for ind in dora_indicators:
         if 0 <= ind < N_TILES:
             seen[ind] += 1
     unseen = np.clip(4 - seen, 0, 4).astype(np.float32) / 4.0
     C[block('unseen')] = unseen
 
+    # --- Riichi ---
     if riichi_flags[seat]:
         C[block('own_riichi')] = 1.0
     for i, opp in enumerate(opps):
         if riichi_flags[opp]:
             C[block('opp_riichi') + i] = 1.0
+
+    # --- Furiten ---
     if furiten_flag:
         C[block('own_furiten')] = 1.0
 
+    # --- Vent de siege, vent du tour, dealer, numero de round ---
     seat_wind = (seat - dealer_seat) % 4
     o = block('seat_wind')
     for k in range(4):
@@ -465,40 +413,35 @@ def build_suphx_obs(*, hands, melds, discards, discard_hist,
     for k in range(4):
         C[o + k] = 1.0 if k == (round_id - 1) else 0.0
 
-    if game_format not in ('tonpuu', 'hanchan'):
-        raise ValueError(f'unknown game_format: {game_format}')
-    o = block('game_format')
-    C[o + (0 if game_format == 'tonpuu' else 1)] = 1.0
+    # [SUPPRIME] game_format -- le format n'est plus encode
+    # [SUPPRIME] round_progress
+
+    # --- Flags de fin de partie ---
     C[block('is_last_normal_round')] = 1.0 if is_last_normal_round else 0.0
     C[block('is_extension')] = 1.0 if is_extension else 0.0
     C[block('extension_index') + min(max(int(extension_index), 0), 7)] = 1.0
-    if normal_round_count is None:
-        normal_round_count = 4 if game_format == 'tonpuu' else 8
-    if round_progress is None:
-        round_progress = round_id
-    progress = min(max(int(round_progress), 1), int(normal_round_count))
-    progress_bucket = min(
-        int((progress - 1) * 10 / max(int(normal_round_count), 1)), 9
-    )
-    C[block('round_progress') + progress_bucket] = 1.0
-    if rounds_remaining is None:
-        rounds_remaining = max(int(normal_round_count) - progress, 0)
-    remaining_bucket = min(
-        int(max(int(rounds_remaining), 0) * 10
-            / max(int(normal_round_count), 1)),
-        9,
-    )
-    C[block('rounds_remaining') + remaining_bucket] = 1.0
 
+    # --- rounds_remaining ABSOLU (one-hot 0-7) ---
+    if rounds_remaining is None:
+        if normal_round_count is None:
+            normal_round_count = 4  # default tonpuu
+        rounds_remaining = max(normal_round_count - round_id, 0)
+    rr = min(max(int(rounds_remaining), 0), 7)
+    C[block('rounds_remaining') + rr] = 1.0
+
+    # --- Honba, kyoutaku ---
     C[block('honba') + min(int(honba), 4)] = 1.0
     C[block('kyoutaku') + min(int(kyoutaku), 4)] = 1.0
 
+    # --- Scores ---
     C[block('own_score') + _score_bucket(scores[seat])] = 1.0
     for i, opp in enumerate(opps):
         C[block(f'opp{i}_score') + _score_bucket(scores[opp])] = 1.0
 
+    # --- Mur restant ---
     C[block('wall_remaining') + _wall_bucket(wall_remaining)] = 1.0
 
+    # --- Look-ahead ---
     if compute_lookahead_flag:
         is_dealer = (seat == dealer_seat)
         unseen_raw = np.clip(4 - seen, 0, 4).astype(np.int32)

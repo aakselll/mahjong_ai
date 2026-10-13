@@ -596,15 +596,20 @@ class MultiAgentMahjongEnv:
         return np.stack(opp_hands + [hidden_wall], axis=0)  # (4, 34)
 
     def _build_obs(self, seat, pending_claim_tile=None):
-        """Retourne (N_CHANNELS, 34) float32 via envs.suphx_features."""
+        """Retourne (N_CHANNELS, 34) float32 via envs.suphx_features.
+        [MODIFIE] Suppression game_format et round_progress.
+        rounds_remaining devient absolu.
+        """
         scores = list(self.ctx.get("scores", [0.0] * 4))
         round_wind = int(self.ctx.get("round_wind_idx", 0))
         round_index = int(self.ctx.get("round_idx", 0))
         round_id = (round_index % 4) + 1
-        normal_round_count = 4
+        normal_round_count = 4  # tonpuu (cet env est tonpuu-only)
         is_extension = round_index >= normal_round_count
         extension_index = max(0, round_index - normal_round_count + 1)
         is_last_normal_round = round_index == normal_round_count - 1
+
+        # [MODIFIE] rounds_remaining ABSOLU
         rounds_remaining = max(normal_round_count - (round_index + 1), 0)
 
         obs = build_suphx_obs(
@@ -625,18 +630,16 @@ class MultiAgentMahjongEnv:
             kyoutaku=self.riichi_deposits,
             seat=seat,
             pending_claim_tile=pending_claim_tile,
-            game_format="tonpuu",
+            # [SUPPRIME] game_format="tonpuu",
             is_last_normal_round=is_last_normal_round,
             is_extension=is_extension,
             extension_index=extension_index,
             normal_round_count=normal_round_count,
-            round_progress=round_index + 1,
+            # [SUPPRIME] round_progress=round_index + 1,
             rounds_remaining=rounds_remaining,
-
         )
         self._pending_oracle = self._build_oracle(seat)
         return obs
-
     def _sl_decide(self, seat, head, mask, pending_claim_tile=None):
         """Appelle le modele SL fige pour cette tete.
 

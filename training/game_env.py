@@ -2,45 +2,37 @@
 Etape 4 du curriculum : Global Reward Prediction (GRP) avec regles
 Mahjong Soul completes.
 
+[MODIF 2026-10-13] Suppression des flags de format des features GRP.
+rounds_remaining absolu (normalise /8) remplace la progression relative.
+
 [TONPUUSEN ONLY] Le modele est entraine sur des parties East-only
-(4 manches max, sans enchousen). Pour rester coherent :
-    - Le self-play worker utilise n_rounds=4
-    - La progression du GRP est normalisee sur 8 (East 1-4 + repeats max)
+(4 manches max, sans enchousen active en pratique).
 
 Regles implementees :
-    - Renchan, Honba (illimite)
-    - Tobi : fin si un joueur passe sous 0 absolu
-    - Agari Yame : all last + dealer 1er + gagne -> fin
-    - Tenpai Yame : all last + dealer 1er + tenpai sur ryuukyoku -> fin
-    - Oorasu : fin East 4 si quelqu'un >= 30k
-    - Enchousen (Sud 1-4) : implemente mais DESACTIVE en pratique
-      (le worker passe n_rounds=4, donc round_num ne depasse jamais 4)
+- Renchan, Honba (illimite)
+- Tobi : fin si un joueur passe sous 0 absolu
+- Agari Yame : all last + dealer 1er + gagne -> fin
+- Tenpai Yame : all last + dealer 1er + tenpai sur ryuukyoku -> fin
+- Oorasu : fin East 4 si quelqu'un >= 30k
+- Enchousen (Sud 1-4) : implemente mais DESACTIVE en pratique
 """
 import numpy as np
-
 from mahjong_ai.envs.multi_agent import MultiAgentMahjongEnv, REWARD_SCALE
 from mahjong_ai.envs.tiles import shanten_of
 from mahjong_ai.agents.reward_predictor import FEATURE_DIM
 
-
-# ─── Constantes Mahjong Soul ────────────────────────────────────────────
-N_ROUNDS_NORMAL = 4     # East 1-4 (fin normale)
-N_ROUNDS_MAX = 8        # East 1-4 + Sud 1-4 (max enchousen)
-MAX_KYOKU = 30          # securite anti-boucle
-
-TARGET_SCORE = 5.0      # 30000 absolus - 25000 = +5.0 en milliers
-TOBI_THRESHOLD = -25.0  # 0 absolu - 25000 = -25.0 en milliers
-
+# --- Constantes Mahjong Soul ---
+N_ROUNDS_NORMAL = 4
+N_ROUNDS_MAX = 8
+MAX_KYOKU = 30
+TARGET_SCORE = 5.0
+TOBI_THRESHOLD = -25.0
 RANK_REWARDS = {1: 15.0, 2: 5.0, 3: -5.0, 4: -15.0}
-
-# [FIX] Progression normalisee sur 8 (tonpuusen : East 1-4 + repeats)
 N_ROUNDS_REF = 8
-
 
 class PredictorHolder:
     def __init__(self):
         self.model = None
-
 
 class GameLogBuffer:
     def __init__(self, max_size=20000):
@@ -58,7 +50,6 @@ class GameLogBuffer:
     def __len__(self):
         return len(self.sequences)
 
-
 def _rank_rewards_from_scores(scores):
     order = sorted(range(4), key=lambda p: (-scores[p], p))
     rewards = {}
@@ -66,9 +57,7 @@ def _rank_rewards_from_scores(scores):
         rewards[player] = RANK_REWARDS[rank]
     return rewards
 
-
 def _decide_dealer_repeat(outcome, dealer_round_reward):
-    """Retourne (dealer_repeats, honba_increments)."""
     if outcome.startswith("abortive"):
         return True, False
     if outcome == "exhaustive":
@@ -76,7 +65,6 @@ def _decide_dealer_repeat(outcome, dealer_round_reward):
         return repeats, repeats
     repeats = dealer_round_reward > 0
     return repeats, repeats
-
 
 class GameEnv:
     def __init__(self, seed=None, predictor_holder=None,
@@ -86,8 +74,7 @@ class GameEnv:
         self.predictor_holder = predictor_holder or PredictorHolder()
         self.game_log_buffer = game_log_buffer
         self.n_rounds = n_rounds
-        self.game_format = game_format or (
-            "tonpuu" if n_rounds <= N_ROUNDS_NORMAL else "hanchan")
+        self.game_format = game_format or "tonpuu"
         self._reset_game_state()
 
     def _reset_game_state(self):
@@ -106,9 +93,6 @@ class GameEnv:
         return [(self.dealer_seat + i) % 4 for i in range(4)]
 
     def reset_round(self):
-        # n_rounds indique le nombre de manches normales avant l'enchousen,
-        # pas une limite de reset. En tonpuu, round 5+ est l'extension de la
-        # meme partie et ne doit pas demarrer une nouvelle partie.
         if (self.kyoku_count >= MAX_KYOKU
                 or self.end_reason is not None):
             self._reset_game_state()
@@ -135,9 +119,7 @@ class GameEnv:
         return self.round_num == N_ROUNDS_MAX
 
     def _check_game_end(self, outcome, dealer_repeats, dealer_real,
-                         dealer_round_reward):
-        """Regles Mahjong Soul (tobi, agari yame, tenpai yame, oorasu,
-        enchousen, max_kyoku)."""
+                        dealer_round_reward):
         ranks = self._current_ranks()
         dealer_rank = ranks[dealer_real]
 
@@ -145,13 +127,12 @@ class GameEnv:
         if any(s <= TOBI_THRESHOLD for s in self.game_scores):
             return True, "tobi"
 
-        # 2-3. Agari yame / Tenpai yame : all last + dealer 1er
+        # 2-3. Agari yame / Tenpai yame
         if self._is_all_last() and dealer_rank == 1:
             dealer_won = (outcome in ("tsumo", "ron", "multi_ron")
                           and dealer_round_reward > 0)
             if dealer_won:
                 return True, "agari_yame"
-
             if outcome == "exhaustive":
                 try:
                     dealer_tenpai = shanten_of(
@@ -212,8 +193,10 @@ class GameEnv:
         # ---- GRP reward ----
         ranks = self._current_ranks()
         grp_rewards = {}
-        format_rounds = (4 if self.game_format == "tonpuu" else 8)
-        progression = min(self.kyoku_count + 1, format_rounds) / float(format_rounds)
+
+        # [MODIFIE] rounds_remaining ABSOLU (tonpuu : 3,2,1,0)
+        format_rounds = 4  # tonpuu (cet env est tonpuu-only)
+        rounds_remaining_abs = max(format_rounds - self.round_num, 0)
 
         for p in range(4):
             gap_leader = max(self.game_scores) - self.game_scores[p]
@@ -222,19 +205,17 @@ class GameEnv:
                 real_round_rewards[p],
                 self.game_scores[p],
                 is_dealer_flag[p],
-                progression,
+                rounds_remaining_abs / 8.0,  # [REPLACE] etait progression
                 riichi_flags[p],
                 ranks[p] / 4.0,
                 gap_leader,
                 gap_last,
-                1.0 if self.game_format == "tonpuu" else 0.0,
-                1.0 if self.game_format == "hanchan" else 0.0,
+                # [SUPPRIME] format_flags[0],
+                # [SUPPRIME] format_flags[1],
                 1.0 if self.round_num == format_rounds else 0.0,
                 1.0 if self.round_num > format_rounds else 0.0,
                 min(max(self.honba, 0), 4) / 4.0,
                 min(max(self.round_env.riichi_deposits, 0), 4) / 4.0,
-                max(format_rounds - self.round_num, 0)
-                / float(format_rounds),
             ], dtype=np.float32)
             self.feature_history[p].append(feat)
 
@@ -255,7 +236,7 @@ class GameEnv:
         dealer_repeats, honba_increments = _decide_dealer_repeat(
             outcome, dealer_round_reward)
 
-        # ---- [MAHJONG SOUL] Regles de fin ----
+        # ---- Regles de fin ----
         game_done, end_reason = self._check_game_end(
             outcome, dealer_repeats, dealer_real, dealer_round_reward)
 
@@ -270,14 +251,15 @@ class GameEnv:
                 self.round_num += 1
                 if self.round_num == N_ROUNDS_NORMAL + 1:
                     self.is_enchousen = True
+            self.kyoku_count += 1
 
-        self.kyoku_count += 1
         if game_done:
             self.end_reason = end_reason
 
         # ---- Log final ----
         if game_done and self.game_log_buffer is not None:
-            final_rewards_by_rank = _rank_rewards_from_scores(self.game_scores)
+            final_rewards_by_rank = _rank_rewards_from_scores(
+                self.game_scores)
             for p in range(4):
                 seq = np.stack(self.feature_history[p], axis=0)
                 self.game_log_buffer.add(seq, final_rewards_by_rank[p])
@@ -321,7 +303,9 @@ class GameEnv:
         mapping = self._seat_mapping()
         flags = [False] * 4
         for internal_seat, real_player in enumerate(mapping):
-            flags[real_player] = self.round_env.riichi[internal_seat]
+            flags[real_player] = (
+                False if self.round_env.riichi is None
+                else self.round_env.riichi[internal_seat])
         return flags
 
     @property

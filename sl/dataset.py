@@ -1,31 +1,39 @@
 """
 Dataset SL partage entre les 5 tetes Suphx, avec cache incremental par shards.
 
+[MODIF 2026-10-13] Suppression du parametre game_format. Le format
+(tonpuu/hanchan) est detecte automatiquement par fichier (voir
+mjai_parser._detect_format) et stocke en METADATA (5e element des
+samples), pas dans les canaux d'entree.
+
+[FIX MEM 2026-10-14] Cap memoire adaptatif. Sur 16GB de RAM, le dataset
+complet ne tient pas (discard seul ~5M samples x 8.7KB = ~43GB). Si le
+nombre de samples correspondants depasse max_samples, un taux
+d'echantillonnage uniforme est calcule depuis le PREMIER shard (les
+fichiers etant shuffles avant le parse, chaque shard est un echantillon
+representatif du dataset) et applique a tous les shards. Deterministe
+(seed fixe) : deux runs avec le meme cap chargent les memes samples.
+
 [FIX 2025-XX-3] Systeme de shards pour reprise sur crash :
   - Le parse est decoupe en shards de SHARD_SIZE fichiers chacun.
   - Chaque shard est ecrit atomiquement (.tmp puis os.replace).
   - Si crash, on reprend au dernier shard ecrit (pas de re-parse).
-  - Signature des fichiers verifiee au resume (evite les incoherences
-    si data-dir / max-files change).
-
-[FIX 2025-XX-4] Migration automatique de l'ancien samples_all.pkl
-vers le format shards (transparent, aucune action utilisateur).
-
-[FIX 2025-XX-5] Log time-based pendant le parse : affichage au moins
-toutes les LOG_INTERVAL_S secondes, plus un log immediat a chaque shard
-ecrit. Evite les longues plages de silence.
+  - Signature des fichiers verifiee au resume.
 
 Layout du cache :
-  cache/sl_2015/
+  cache/sl_v2/
   +-- _shards/
   |   +-- shard_000000_000100.pkl   (fichiers 0..99)
-  |   +-- shard_000100_000200.pkl   (fichiers 100..199)
   |   +-- ...
-  +-- _meta.pkl                     (signature pour valider le resume)
-  +-- samples_all.pkl               (legacy, migre auto)
+  +-- _meta.pkl                     (signature + n_channels + version)
 
-Le filtrage par tete se fait pendant le chargement : la memoire au
-chargement est bornee a 1 shard + les samples filtres.
+Chaque shard contient des tuples :
+  (obs_u8, atype, act, fid, fmt)
+    - obs_u8 : np.array (N_CHANNELS, 34) uint8
+    - atype  : int (type d'action)
+    - act    : int (label)
+    - fid    : int (file_id)
+    - fmt    : str ("tonpuu" ou "hanchan") -- METADATA, pas une feature
 """
 import glob
 import hashlib
@@ -54,29 +62,41 @@ HEAD_TO_ACTION_TYPE = {
 SHARD_SIZE = 100        # nombre de fichiers par shard
 SIG_SAMPLE = 1000       # nombre de fichiers utilises pour la signature
 LOG_INTERVAL_S = 20     # intervalle max entre deux logs de progression
+SAMPLE_VERSION = 2      # format des samples : 5-tuples avec fmt en metadata
+
+# [FIX MEM] Cap par defaut : ~500k samples x 8.7KB ~ 4.4GB de RAM.
+# Les petites tetes (kong, pong, riichi) ne l'atteignent generalement pas
+# et passent a 100%. Passer None (ou 0 en CLI) pour tout charger.
+DEFAULT_MAX_SAMPLES = 500_000
 
 
 # ====================================================================== #
 # Helpers top-level (picklables pour multiprocessing Windows)
 # ====================================================================== #
 def _parse_one_file(task):
-    """Parse UN fichier -> (file_id, samples_list_or_None)."""
-    file_id, path, game_format = task
+    """Parse UN fichier -> (file_id, samples_list_or_None, game_format).
+
+    task : tuple (file_id, path) -- 2 elements.
+    Retour : tuple de 3 (file_id, samples, game_format).
+    """
+    file_id, path = task
     try:
         events = parse_mjai_zst_file(path)
         if not events:
-            return file_id, []
+            return file_id, [], None
+        # Nouvelle signature : pas de game_format=, retour = tuple
+        samples, game_format = events_to_samples_all_povs(events)
         out = []
-        for s in events_to_samples_all_povs(events, game_format=game_format):
-            obs, atype, action, _mask = s
+        for obs, atype, action, _mask in samples:
             obs_u8 = np.clip(
                 np.round(np.asarray(obs, dtype=np.float32) * 255.0),
                 0, 255,
             ).astype(np.uint8)
-            out.append((obs_u8, int(atype), int(action), file_id))
-        return file_id, out
+            # fmt stocke en 5e element (metadata, pas une feature)
+            out.append((obs_u8, int(atype), int(action), file_id, game_format))
+        return file_id, out, game_format
     except Exception:
-        return file_id, None
+        return file_id, None, None
 
 
 def _format_duration(seconds):
@@ -133,66 +153,61 @@ def _count_shards(shard_dir):
     return len(glob.glob(os.path.join(shard_dir, 'shard_*.pkl')))
 
 
-def _migrate_pkl_to_shards(pkl_path, shard_dir, shard_size=SHARD_SIZE, verbose=True):
-    """Convertit un samples_all.pkl legacy en shards. Supprime le pkl."""
-    if verbose:
-        print(f'[migrate] chargement {pkl_path}...', flush=True)
-    t0 = time.time()
-    with open(pkl_path, 'rb') as f:
-        samples = pickle.load(f)
-    if verbose:
-        print(f'[migrate] {len(samples)} samples charges en '
-              f'{time.time()-t0:.1f}s', flush=True)
-
-    by_fid = {}
-    for s in samples:
-        by_fid.setdefault(s[3], []).append(s)
-    fids = sorted(by_fid.keys())
-    if verbose:
-        print(f'[migrate] {len(fids)} file_ids distincts '
-              f'({fids[0]}..{fids[-1]})', flush=True)
-
-    os.makedirs(shard_dir, exist_ok=True)
-    for i in range(0, len(fids), shard_size):
-        chunk = fids[i:i+shard_size]
-        start, end = chunk[0], chunk[-1] + 1
-        shard_samples = []
-        for fid in chunk:
-            shard_samples.extend(by_fid[fid])
-        name = f'shard_{start:06d}_{end:06d}.pkl'
-        path = os.path.join(shard_dir, name)
-        tmp = path + '.tmp'
-        with open(tmp, 'wb') as f:
-            pickle.dump(shard_samples, f, protocol=4)
-        os.replace(tmp, path)
-        if verbose:
-            print(f'  [migrate] {name}: {len(shard_samples)} samples',
-                  flush=True)
-
-    os.remove(pkl_path)
-    if verbose:
-        print(f'[migrate] termine, {pkl_path} supprime', flush=True)
-
-
 def _load_all_shards_filtered(shard_dir, action_type, verbose=False,
-                                head_type='?'):
-    """Charge tous les shards, filtre par action_type, renvoie la liste."""
+                              head_type='?', max_samples=None, seed=42):
+    """Charge tous les shards, filtre par action_type.
+
+    [FIX MEM] Si max_samples est fixe et que le total estime depasse le cap,
+    un taux d'echantillonnage uniforme est calcule depuis le PREMIER shard
+    puis applique a tous. Le premier shard sert d'estimateur : les fichiers
+    ont ete shuffles avant le parse, donc chaque shard est un echantillon
+    representatif. Deterministe (seed fixe).
+
+    Retourne une liste de 4-tuples (obs_u8, act, fid, fmt).
+    """
     shard_files = sorted(glob.glob(os.path.join(shard_dir, 'shard_*.pkl')))
+    if not shard_files:
+        return []
+
+    # --- Estimation adaptive du taux depuis le premier shard ---
+    rate = 1.0
+    if max_samples is not None:
+        with open(shard_files[0], 'rb') as f:
+            first = pickle.load(f)
+        first_matching = sum(1 for s in first
+                             if len(s) >= 2 and s[1] == action_type)
+        est_total = first_matching * len(shard_files)
+        if est_total > max_samples and est_total > 0:
+            rate = max_samples / float(est_total)
+        del first
+        if verbose:
+            print(f'  [load/{head_type}] estimation : ~{est_total} samples '
+                  f'correspondants, cap={max_samples} -> '
+                  f'rate={rate:.3f}', flush=True)
+
+    rng = random.Random(seed)
     out = []
     total_raw = 0
+    total_matching = 0
     for i, sf in enumerate(shard_files):
         with open(sf, 'rb') as f:
             shard = pickle.load(f)
         total_raw += len(shard)
-        for obs_u8, atype, act, fid in shard:
+        for sample in shard:
+            obs_u8, atype, act, fid, fmt = sample
             if atype == action_type:
-                out.append((obs_u8, act, fid))
+                total_matching += 1
+                if rate >= 1.0 or rng.random() < rate:
+                    out.append((obs_u8, act, fid, fmt))
+        del shard  # liberer le shard transient immediatement
         if verbose and (i + 1) % 20 == 0:
             print(f'  [load/{head_type}] {i+1}/{len(shard_files)} shards '
-                  f'charges, {len(out)} samples filtres', flush=True)
+                  f'charges, {len(out)} samples gardes', flush=True)
     if verbose:
+        mem_gb = len(out) * 8.8 / 1024 / 1024
         print(f'  [load/{head_type}] {len(shard_files)} shards, '
-              f'{total_raw} samples bruts, {len(out)} apres filtre',
+              f'{total_raw} samples bruts, {total_matching} correspondants, '
+              f'{len(out)} gardes (rate={rate:.3f}, ~{mem_gb:.1f} GB RAM)',
               flush=True)
     return out
 
@@ -201,26 +216,34 @@ def _load_all_shards_filtered(shard_dir, action_type, verbose=False,
 # Dataset
 # ====================================================================== #
 class PolicyDataset(Dataset):
-    """Echantillons (obs (N_CHANNELS, 34) uint8, label, file_id) pour UNE tete.
+    """Echantillons (obs (N_CHANNELS, 34) uint8, label, file_id, format)
+    pour UNE tete.
 
+    [MODIF] Plus de parametre game_format : detecte par fichier.
+    self.samples : liste de 4-tuples (obs_u8, act, fid, fmt).
+    self.sample_formats : liste parallele des formats (pour sampler).
     Cache partage entre les 5 tetes : contient tous les types d'action.
     Filtre en memoire au chargement.
+
+    [FIX MEM] max_samples : cap sur le nombre de samples charges en RAM.
+    None = tout charger (a ne faire que si assez de RAM). Le default
+    (DEFAULT_MAX_SAMPLES) protege les machines 16GB.
     """
 
     def __init__(self, files, head_type, cache_path=None, verbose=True,
-                 parse_workers=1, shard_size=SHARD_SIZE, game_format="hanchan"):
+                 parse_workers=1, shard_size=SHARD_SIZE,
+                 max_samples=DEFAULT_MAX_SAMPLES):
         assert head_type in HEAD_TO_ACTION_TYPE, f'Tete inconnue : {head_type}'
         self.head_type = head_type
-        if game_format not in ("hanchan", "tonpuu", "both"):
-            raise ValueError(f"format inconnu: {game_format}")
-        self.game_format = game_format
         self.action_type = HEAD_TO_ACTION_TYPE[head_type]
         self._parse_workers = max(1, int(parse_workers))
         self._shard_size = max(1, int(shard_size))
+        self._max_samples = max_samples
+        self.sample_formats = []
 
         if cache_path is None:
             # Pas de cache -> parse en memoire sans shards
-            self.samples = self._parse_no_cache(files, verbose)
+            self._parse_no_cache(files, verbose)
             return
 
         cache_dir = os.path.dirname(cache_path) or '.'
@@ -228,27 +251,17 @@ class PolicyDataset(Dataset):
         meta_path = os.path.join(cache_dir, '_meta.pkl')
         os.makedirs(cache_dir, exist_ok=True)
 
-        # 1) Migration auto si pkl legacy et pas de shards
-        if os.path.isfile(cache_path) and not _has_shards(shard_dir):
-            if verbose:
-                print(f'[dataset/{head_type}] migration legacy pkl -> shards',
-                      flush=True)
-            _migrate_pkl_to_shards(cache_path, shard_dir,
-                                    shard_size=self._shard_size, verbose=verbose)
-
-        # 2) Etat actuel
-        n_files_total = len(files)
-        start_file_id = _scan_last_file_id(shard_dir)
+        # 1) Verification du meta (invalidation auto si layout change)
         if os.path.isfile(meta_path):
             with open(meta_path, 'rb') as f:
                 meta = pickle.load(f)
-            if (meta.get('game_format') != self.game_format
-                    or meta.get('n_channels') != N_CHANNELS):
+            if (meta.get('n_channels') != N_CHANNELS
+                    or meta.get('sample_version') != SAMPLE_VERSION):
                 raise RuntimeError(
-                    'Cache incompatible avec le format ou les features: '
-                    f'cache={meta.get("game_format")}/'
-                    f'{meta.get("n_channels")}, '
-                    f'actuel={self.game_format}/{N_CHANNELS}. '
+                    f'Cache incompatible : '
+                    f'n_channels={meta.get("n_channels")}/'
+                    f'{N_CHANNELS}, sample_version='
+                    f'{meta.get("sample_version")}/{SAMPLE_VERSION}. '
                     f'Supprimez {shard_dir}/ et {meta_path}.'
                 )
         elif _has_shards(shard_dir):
@@ -256,6 +269,10 @@ class PolicyDataset(Dataset):
                 f'Metadonnees absentes pour le cache {shard_dir}. '
                 'Supprimez ce cache pour le regenerer.'
             )
+
+        # 2) Etat actuel
+        n_files_total = len(files)
+        start_file_id = _scan_last_file_id(shard_dir)
 
         if verbose:
             n_shards = _count_shards(shard_dir)
@@ -278,48 +295,75 @@ class PolicyDataset(Dataset):
                       f'demandes (le cache contient plus de donnees que '
                       f'necessaire, on charge tout)', flush=True)
 
-        # 4) Chargement filtre
+        # 4) Chargement filtre (avec cap memoire)
         if verbose:
             t0 = time.time()
-            print(f'[dataset/{head_type}] chargement + filtre des shards...',
-                  flush=True)
-        self.samples = _load_all_shards_filtered(
+            cap_str = (f'cap={max_samples}' if max_samples
+                       else 'cap=aucun (tout charger)')
+            print(f'[dataset/{head_type}] chargement + filtre des shards '
+                  f'({cap_str})...', flush=True)
+        filtered = _load_all_shards_filtered(
             shard_dir, self.action_type, verbose=verbose,
             head_type=head_type,
+            max_samples=self._max_samples, seed=42,
         )
+        self.samples = filtered
+        self.sample_formats = [s[3] for s in filtered]
+
         if verbose:
+            n_ton = sum(1 for f in self.sample_formats if f == 'tonpuu')
+            n_han = sum(1 for f in self.sample_formats if f == 'hanchan')
             print(f'[dataset/{head_type}] {len(self.samples)} echantillons '
-                  f'apres filtre en {time.time()-t0:.1f}s', flush=True)
+                  f'(tonpuu={n_ton}, hanchan={n_han}) en '
+                  f'{time.time()-t0:.1f}s', flush=True)
 
     # ------------------------------------------------------------------ #
     def _parse_no_cache(self, files, verbose):
-        """Parse sans cache (mode in-memory)."""
+        """Parse sans cache (mode in-memory).
+
+        [FIX MEM] Trim incremental : si le nombre de samples depasse le cap,
+        on resample aleatoirement a max_samples. Le pic memoire reste borne
+        a cap + 100k samples.
+        """
         if verbose:
             print(f'[dataset/{self.head_type}] parse sans cache '
                   f'({self._parse_workers} worker(s))...', flush=True)
         t0 = time.time()
-        tasks = [(i, path, self.game_format)
-                 for i, path in enumerate(files)]
+        tasks = [(i, path) for i, path in enumerate(files)]
         out = []
+
+        def _maybe_trim():
+            nonlocal out
+            if (self._max_samples is not None
+                    and len(out) >= self._max_samples + 100_000):
+                out = random.Random(123).sample(out, self._max_samples)
+
         if self._parse_workers <= 1:
             for task in tasks:
-                _, samples = _parse_one_file(task)
+                _fid, samples, _fmt = _parse_one_file(task)
                 if samples:
-                    for obs_u8, atype, act, fid in samples:
+                    for s in samples:
+                        obs_u8, atype, act, fid, fmt = s
                         if atype == self.action_type:
-                            out.append((obs_u8, act, fid))
+                            out.append((obs_u8, act, fid, fmt))
+                _maybe_trim()
         else:
             import multiprocessing as mp
             with mp.Pool(processes=self._parse_workers) as pool:
-                for _, samples in pool.imap(_parse_one_file, tasks, chunksize=1):
+                for _fid, samples, _fmt in pool.imap(
+                        _parse_one_file, tasks, chunksize=1):
                     if samples:
-                        for obs_u8, atype, act, fid in samples:
+                        for s in samples:
+                            obs_u8, atype, act, fid, fmt = s
                             if atype == self.action_type:
-                                out.append((obs_u8, act, fid))
+                                out.append((obs_u8, act, fid, fmt))
+                    _maybe_trim()
+
+        self.samples = out
+        self.sample_formats = [s[3] for s in out]
         if verbose:
             print(f'[dataset/{self.head_type}] {len(out)} samples '
                   f'en {_format_duration(time.time()-t0)}', flush=True)
-        return out
 
     # ------------------------------------------------------------------ #
     def _parse_range(self, files, start_id, end_id, shard_dir, meta_path, verbose):
@@ -343,22 +387,13 @@ class PolicyDataset(Dataset):
                     f'{shard_dir}/ et {meta_path} pour reparcourir, ou '
                     f'revenez a la config d\'origine.'
                 )
-            if (meta.get('game_format') != self.game_format
-                    or meta.get('n_channels') != N_CHANNELS):
-                raise RuntimeError(
-                    'Cache incompatible avec le format ou les features: '
-                    f'cache={meta.get("game_format")}/'
-                    f'{meta.get("n_channels")}, '
-                    f'actuel={self.game_format}/{N_CHANNELS}. '
-                    f'Supprimez {shard_dir}/ et {meta_path}.'
-                )
         else:
             with open(meta_path, 'wb') as f:
                 pickle.dump({
                     'signature': sig,
                     'created': time.time(),
-                    'game_format': self.game_format,
                     'n_channels': N_CHANNELS,
+                    'sample_version': SAMPLE_VERSION,
                 }, f)
 
         if verbose:
@@ -367,8 +402,7 @@ class PolicyDataset(Dataset):
                   f'shard_size={self._shard_size}...', flush=True)
 
         t_start = time.time()
-        tasks = [(fid, files[fid], self.game_format)
-                 for fid in range(start_id, end_id)]
+        tasks = [(fid, files[fid]) for fid in range(start_id, end_id)]
 
         # Buffers de shard (mutables via dict)
         state = {
@@ -393,7 +427,6 @@ class PolicyDataset(Dataset):
             if verbose:
                 print(f"  [shard] {name} ({len(state['buffer'])} samples, "
                       f"{state['files_in_shard']} fichiers)", flush=True)
-            # Reset + log immediat
             last_log_time[0] = time.time()
             state['buffer'] = []
             state['start'] = state['end']
@@ -430,15 +463,15 @@ class PolicyDataset(Dataset):
                   f"buffer={len(state['buffer'])}", flush=True)
 
         if self._parse_workers <= 1:
-            for fid, path in tasks:
-                _fid, samples = _parse_one_file((fid, path, self.game_format))
+            for task in tasks:
+                _fid, samples, _fmt = _parse_one_file(task)
                 process(_fid, samples)
                 log_progress()
         else:
             import multiprocessing as mp
             with mp.Pool(processes=self._parse_workers) as pool:
-                # imap (ordonne) : necessaire pour frontiere de shards propre
-                for fid, samples in pool.imap(_parse_one_file, tasks, chunksize=1):
+                for fid, samples, _fmt in pool.imap(
+                        _parse_one_file, tasks, chunksize=1):
                     process(fid, samples)
                     log_progress()
 
@@ -453,7 +486,7 @@ class PolicyDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, i):
-        obs_u8, label, _file_id = self.samples[i]
+        obs_u8, label, _fid, _fmt = self.samples[i]
         obs_f32 = obs_u8.astype(np.float32) / 255.0
         return torch.from_numpy(obs_f32), torch.tensor(label, dtype=torch.long)
 
@@ -465,7 +498,7 @@ class PolicyDataset(Dataset):
         val_files = set(np.array(file_ids)[perm[:n_val]].tolist())
 
         train_idx, val_idx = [], []
-        for i, (_, _, fid) in enumerate(self.samples):
+        for i, (_, _, fid, _fmt) in enumerate(self.samples):
             (val_idx if fid in val_files else train_idx).append(i)
         return train_idx, val_idx
 
