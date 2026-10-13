@@ -158,10 +158,11 @@ def _load_all_shards_filtered(shard_dir, action_type, verbose=False,
     """Charge tous les shards, filtre par action_type.
 
     [FIX MEM] Si max_samples est fixe et que le total estime depasse le cap,
-    un taux d'echantillonnage uniforme est calcule depuis le PREMIER shard
-    puis applique a tous. Le premier shard sert d'estimateur : les fichiers
-    ont ete shuffles avant le parse, donc chaque shard est un echantillon
-    representatif. Deterministe (seed fixe).
+    un taux d'echantillonnage uniforme est calcule depuis les 5 PREMIERS
+    shards (la variance inter-shards etant elevee, un seul shard sous-estime
+    parfois le total d'un facteur 4x). Un trim final de securite garantit
+    ensuite le cap quoi qu'il arrive, meme si l'estimation etait encore
+    trop basse. Deterministe (seeds fixes).
 
     Retourne une liste de 4-tuples (obs_u8, act, fid, fmt).
     """
@@ -169,21 +170,26 @@ def _load_all_shards_filtered(shard_dir, action_type, verbose=False,
     if not shard_files:
         return []
 
-    # --- Estimation adaptive du taux depuis le premier shard ---
+    # --- Estimation du taux sur 5 shards + marge de securite ---
     rate = 1.0
     if max_samples is not None:
-        with open(shard_files[0], 'rb') as f:
-            first = pickle.load(f)
-        first_matching = sum(1 for s in first
-                             if len(s) >= 2 and s[1] == action_type)
-        est_total = first_matching * len(shard_files)
+        n_est = min(5, len(shard_files))
+        est_matching = 0
+        for sf in shard_files[:n_est]:
+            with open(sf, 'rb') as f:
+                s = pickle.load(f)
+            est_matching += sum(1 for x in s if len(x) >= 2
+                                and x[1] == action_type)
+            del s
+        est_total = est_matching * len(shard_files) / n_est
         if est_total > max_samples and est_total > 0:
-            rate = max_samples / float(est_total)
-        del first
+            # Marge de 15% : si l'estimation sous-estime encore, le trim
+            # final corrige ; si elle surestime, on perd au pire 15% de cap.
+            rate = (0.85 * max_samples) / float(est_total)
         if verbose:
-            print(f'  [load/{head_type}] estimation : ~{est_total} samples '
-                  f'correspondants, cap={max_samples} -> '
-                  f'rate={rate:.3f}', flush=True)
+            print(f'  [load/{head_type}] estimation : ~{int(est_total)} '
+                  f'correspondants, cap={max_samples} -> rate={rate:.3f}',
+                  flush=True)
 
     rng = random.Random(seed)
     out = []
@@ -203,6 +209,16 @@ def _load_all_shards_filtered(shard_dir, action_type, verbose=False,
         if verbose and (i + 1) % 20 == 0:
             print(f'  [load/{head_type}] {i+1}/{len(shard_files)} shards '
                   f'charges, {len(out)} samples gardes', flush=True)
+
+    # --- Trim final de securite : le cap est JAMAIS depasse ---
+    if max_samples is not None and len(out) > max_samples:
+        trim_rng = random.Random(seed + 1)
+        out = trim_rng.sample(out, max_samples)
+        if verbose:
+            print(f'  [load/{head_type}] trim securite : '
+                  f'{max_samples} / {total_matching} gardes '
+                  f'(estimation trop basse, corrigee)', flush=True)
+
     if verbose:
         mem_gb = len(out) * 8.8 / 1024 / 1024
         print(f'  [load/{head_type}] {len(shard_files)} shards, '
@@ -210,7 +226,6 @@ def _load_all_shards_filtered(shard_dir, action_type, verbose=False,
               f'{len(out)} gardes (rate={rate:.3f}, ~{mem_gb:.1f} GB RAM)',
               flush=True)
     return out
-
 
 # ====================================================================== #
 # Dataset
