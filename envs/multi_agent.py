@@ -243,20 +243,13 @@ class MultiAgentMahjongEnv:
             self._next_dora_pair_idx += 1
 
     def _should_declare_ron(self, seat, win_result):
-        """Regle rule-based Suphx §2.1 pour declarer RON.
-
-        Not last round -> toujours declarer.
-        Last round -> declarer sauf si ca nous laisse dernier apres le gain.
-        """
         scores = list(self.ctx.get("scores", [0.0] * 4))
         round_idx = int(self.ctx.get("round_idx", 0))
-        n_rounds = 4   # East 1-4
+        n_rounds = 4   # [NOTE] env tonpuu-only ; 8 pour un usage hanchan
 
-        # Pas la derniere manche : declarer
         if round_idx < n_rounds - 1:
             return True
 
-        # Derniere manche : verifier le classement apres RON
         cost = win_result.cost
         if isinstance(cost, dict):
             gain = cost.get("total", 0) / 1000.0
@@ -266,8 +259,10 @@ class MultiAgentMahjongEnv:
         new_scores = scores.copy()
         new_scores[seat] += gain
 
-        # Si apres le gain on reste dernier, ne pas declarer
-        if new_scores[seat] <= min(new_scores):
+        # [FIX] refuser seulement si on RESTE dernier apres le gain.
+        # (l'ancien code refusait si on ne devenait pas 1er -- faux)
+        others = [new_scores[o] for o in range(4) if o != seat]
+        if new_scores[seat] <= max(others) and new_scores[seat] <= min(others):
             return False
         return True
 
@@ -821,7 +816,6 @@ class MultiAgentMahjongEnv:
                                     prev_pending = pending
                                     for o in list(chankan_candidates.keys()):
                                         if self.frozen_sl is not None:
-                                            # [FIX] RL : rule-based
                                             if self._should_declare_ron(o, chankan_candidates[o]):
                                                 chankan_ronners[o] = chankan_candidates[o]
                                                 prev_pending = (0.0, o)
@@ -842,6 +836,27 @@ class MultiAgentMahjongEnv:
                                                 self._furiten_temp[o] = True
                                                 self._stats["ron_refused"] += 1
                                                 prev_pending = (-RON_REFUSE_PENALTY, o)
+
+                                    # [FIX CHANKAN] Resolution du ron sur kakan :
+                                    # bloquait ici -- le kan-declareur PAYE le ron,
+                                    # la manche se termine.
+                                    if chankan_ronners:
+                                        if len(chankan_ronners) > 1:
+                                            self._stats["multi_ron"] += 1
+                                        else:
+                                            self._stats["ron"] += 1
+                                        final_rewards = self._zero_rewards()
+                                        for k_o, (o, res) in enumerate(chankan_ronners.items()):
+                                            payment = self._distribute_win_payment(
+                                                o, seat, res, give_kyoutaku=(k_o == 0))
+                                            self._record_win_yaku(o, res)
+                                            for s in range(4):
+                                                final_rewards[s] += payment[s]
+                                        outcome = "multi_ron" if len(chankan_ronners) > 1 else "ron"
+                                        return self._final(prev_pending[0], prev_pending[1],
+                                                           final_rewards, outcome)
+
+                            abort = self._check_abortive_draw()
 
                             abort = self._check_abortive_draw()
                             if abort:

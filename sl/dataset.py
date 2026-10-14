@@ -226,7 +226,6 @@ def _load_all_shards_filtered(shard_dir, action_type, verbose=False,
               f'{len(out)} gardes (rate={rate:.3f}, ~{mem_gb:.1f} GB RAM)',
               flush=True)
     return out
-
 # ====================================================================== #
 # Dataset
 # ====================================================================== #

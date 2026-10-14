@@ -4,9 +4,8 @@ Utilise un cache PARTAGE entre les 5 tetes : le premier run parse tout
 et ecrit /_shards/ ; les runs suivants chargent ce cache en quelques
 secondes et filtrent en memoire.
 
-[MODIF 2026-10-13] Suppression du parametre --game-format.
-Le format est detecte automatiquement par fichier et stocke en metadata.
-Le sampler equilibre tonpuu/hanchan utilise la metadata (pas les canaux).
+[MODIF 2026-10-14] Ajout de --max-samples : cap memoire sur le nombre
+de samples charges en RAM (protection 16GB). Default auto = 500k.
 
 [FIX 2025-XX-8] Weighted loss UNIQUEMENT pour chow.
 - chow : desequilibre extreme (96% PASS / 4% chow) -> weighted loss
@@ -23,34 +22,43 @@ l'oscillation.
 
 Usage :
 python -m mahjong_ai.sl.train_policy_sl ^
-    --head discard --data-dir data/tenhou ^
-    --cache-dir cache/sl_v2 ^
-    --output checkpoints/sl_v2/discard.pt ^
+    --head discard --data-dir data/tenhou_tonpusen ^
+    --cache-dir cache/sl_tonpusen ^
+    --output checkpoints/sl_tonpusen_light/discard.pt ^
     --max-files 2900 --epochs 2 --batch-size 128 --num-workers 0 ^
-    --parse-workers 5
+    --parse-workers 5 --max-samples 400000
 """
 import argparse
 import os
 import time
 from collections import Counter
+
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler, Subset
-from mahjong_ai.sl.dataset import PolicyDataset, discover_files
+
+from mahjong_ai.sl.dataset import (
+    PolicyDataset, discover_files, DEFAULT_MAX_SAMPLES
+)
 from mahjong_ai.agents.suphx_cnn import build_model, N_CHANNELS
 
 # Tete(s) pour laquelle/lesquelles on utilise la weighted loss.
+# Ajouter ici si tu constates un collapse sur une autre tete.
 WEIGHTED_LOSS_HEADS = {'chow', 'riichi'}
+
 
 def make_collate():
     def collate(batch):
-        chs = torch.stack([b[0] for b in batch], dim=0)
-        labels = torch.stack([b[1] for b in batch], dim=0)
+        chs = torch.stack([b[0] for b in batch], dim=0)      # (B, N_CHANNELS, 34)
+        labels = torch.stack([b[1] for b in batch], dim=0)   # (B,)
         return chs, labels
     return collate
 
+
 @torch.no_grad()
 def evaluate(model, loader, device, class_weights=None):
+    """Evalue le modele. La loss est ponderee de la meme facon qu'en
+    training pour que val_loss soit comparable a train_loss."""
     model.eval()
     total_loss, correct, n = 0.0, 0, 0
     for chs, labels in loader:
@@ -64,7 +72,15 @@ def evaluate(model, loader, device, class_weights=None):
     model.train()
     return total_loss / max(n, 1), correct / max(n, 1)
 
+
 def compute_class_weights(train_ds, ds, n_classes, device, head_type):
+    """Ponderation par l'inverse de la frequence, UNIQUEMENT pour les tetes
+    listees dans WEIGHTED_LOSS_HEADS. Retourne None sinon (loss standard).
+
+    Formule : weight[c] = n_total / (n_classes * count[c])
+    - Classes frequentes -> poids < 1 (leur erreur compte moins)
+    - Classes rares    -> poids > 1 (leur erreur compte plus)
+    """
     if head_type not in WEIGHTED_LOSS_HEADS:
         return None
     train_labels = [ds.samples[i][1] for i in train_ds.indices]
@@ -72,13 +88,15 @@ def compute_class_weights(train_ds, ds, n_classes, device, head_type):
     total = sum(counts.values())
     weights_list = []
     for c in range(n_classes):
-        cnt = max(counts.get(c, 1), 1)
+        cnt = max(counts.get(c, 1), 1)   # evite div par 0 pour classes absentes
+        #weights_list.append(total / (n_classes * cnt))
         weights_list.append((total / (n_classes * cnt)) ** 0.5)
     return torch.tensor(weights_list, dtype=torch.float32, device=device)
 
+
 def _format_indices_from_metadata(dataset):
     """Retourne les indices des echantillons tonpuu et hanchan.
-    [MODIFIE] Utilise la metadata (dataset.sample_formats), pas les canaux.
+    Utilise la metadata (dataset.sample_formats), pas les canaux.
     """
     tonpuu, hanchan = [], []
     for index in range(len(dataset)):
@@ -89,10 +107,9 @@ def _format_indices_from_metadata(dataset):
             hanchan.append(index)
     return tonpuu, hanchan
 
+
 def _balanced_sampler(dataset, indices):
-    """Echantillonne a parts egales tonpuu/hanchan via metadata.
-    [MODIFIE] Utilise dataset.sample_formats (metadata), pas les canaux.
-    """
+    """Echantillonne a parts egales tonpuu/hanchan via metadata."""
     counts = {"tonpuu": 0, "hanchan": 0}
     labels = []
     for index in indices:
@@ -106,6 +123,7 @@ def _balanced_sampler(dataset, indices):
         replacement=True,
     )
 
+
 def train(args):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f'[train/{args.head}] device={device}', flush=True)
@@ -117,9 +135,18 @@ def train(args):
         os.makedirs(args.cache_dir, exist_ok=True)
         cache = os.path.join(args.cache_dir, 'samples_all.pkl')
 
+    # Resolution du cap : None -> default auto, 0 -> pas de cap
+    if args.max_samples is None:
+        max_samples = DEFAULT_MAX_SAMPLES
+    elif args.max_samples <= 0:
+        max_samples = None
+    else:
+        max_samples = args.max_samples
+
     ds = PolicyDataset(
         files, args.head, cache_path=cache, verbose=True,
         parse_workers=args.parse_workers,
+        max_samples=max_samples,
     )
 
     if len(ds) == 0:
@@ -129,7 +156,7 @@ def train(args):
     print(f'[train/{args.head}] train={len(train_ds)}  val={len(val_ds)}',
           flush=True)
 
-    # [MODIFIE] Statistiques par format via metadata
+    # Statistiques par format via metadata
     train_tonpuu, train_hanchan = _format_indices_from_metadata(ds)
     print(f'[train/{args.head}] format total: '
           f'tonpuu={len(train_tonpuu)} hanchan={len(train_hanchan)}',
@@ -139,11 +166,11 @@ def train(args):
     if args.head == 'discard':
         n_classes = 34
     elif args.head == 'chow':
-        n_classes = 4
+        n_classes = 4          # PASS / LOWER / MID / UPPER
     else:
-        n_classes = 2
+        n_classes = 2          # riichi / pong / kong
 
-    # ---------------- Poids de classe (chow uniquement) ----------------
+    # ---------------- Poids de classe ----------------
     class_weights = compute_class_weights(
         train_ds, ds, n_classes, device, head_type=args.head)
     if class_weights is not None:
@@ -164,13 +191,12 @@ def train(args):
     # ---------------- DataLoaders ----------------
     pin = (device == 'cuda')
 
-    # [MODIFIE] Sampler equilibre si les deux formats sont presents
+    # Sampler equilibre si les deux formats sont presents
     sampler = None
     shuffle = True
     n_ton = len(train_tonpuu)
     n_han = len(train_hanchan)
     if n_ton > 0 and n_han > 0:
-        # Les deux formats presents -> equilibre 50/50
         sampler = _balanced_sampler(ds, train_ds.indices)
         shuffle = False
         print(f'[train/{args.head}] sampler format equilibre 50/50 '
@@ -188,9 +214,11 @@ def train(args):
         pin_memory=pin,
     )
 
-    # [MODIFIE] Validateurs par format via metadata
-    val_tonpuu = [i for i in val_ds.indices if ds.sample_formats[i] == 'tonpuu']
-    val_hanchan = [i for i in val_ds.indices if ds.sample_formats[i] == 'hanchan']
+    # Validateurs par format via metadata
+    val_tonpuu = [i for i in val_ds.indices
+                  if ds.sample_formats[i] == 'tonpuu']
+    val_hanchan = [i for i in val_ds.indices
+                   if ds.sample_formats[i] == 'hanchan']
     val_format_loaders = {}
     for name, indices in (('tonpuu', val_tonpuu), ('hanchan', val_hanchan)):
         if indices:
@@ -260,7 +288,10 @@ def train(args):
             chs = chs.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             logits = model(chs)
+
+            # Loss ponderee SEULEMENT si class_weights n'est pas None
             loss = F.cross_entropy(logits, labels, weight=class_weights)
+
             optim.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
@@ -279,7 +310,7 @@ def train(args):
         va_loss, va_acc = evaluate(model, val_loader, device,
                                    class_weights=class_weights)
 
-        # [MODIFIE] Metriques par format
+        # Metriques par format
         format_metrics = []
         for format_name, format_loader in val_format_loaders.items():
             _, format_acc = evaluate(
@@ -314,6 +345,7 @@ def train(args):
 
     print(f'[train/{args.head}] best val_acc = {best_val_acc:.4f}', flush=True)
 
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--head', required=True,
@@ -321,24 +353,40 @@ def main():
     p.add_argument('--data-dir', required=True)
     p.add_argument('--cache-dir', default=None)
     p.add_argument('--max-files', type=int, default=None)
-    # [SUPPRIME] --game-format (detecte automatiquement par fichier)
     p.add_argument('--output', required=True)
+
+    # Warm-start : charge un checkpoint existant de la MEME tete.
     p.add_argument('--warm-start', type=str, default=None,
                    help='chemin vers un .pt existant a charger avant '
-                   'entrainement (head_type doit correspondre). '
-                   'Avec warm-start, utiliser --lr 1e-4.')
+                        'entrainement (head_type doit correspondre). '
+                        'Avec warm-start, utiliser --lr 1e-4.')
+
     p.add_argument('--batch-size', type=int, default=128)
     p.add_argument('--epochs', type=int, default=10)
     p.add_argument('--lr', type=float, default=1e-3)
     p.add_argument('--weight-decay', type=float, default=1e-4)
     p.add_argument('--val-fraction', type=float, default=0.1)
-    p.add_argument('--num-workers', type=int, default=0)
-    p.add_argument('--parse-workers', type=int, default=1)
+    p.add_argument('--num-workers', type=int, default=0,
+                   help='DataLoader workers (training), 0 sur Windows')
+
+    # Multiprocessing du PARSING (pas du training)
+    p.add_argument('--parse-workers', type=int, default=1,
+                   help='nombre de process pour le parsing ; 1 = serie, '
+                        '>1 = multiprocessing (Windows-safe)')
+
+    # [MODIF] Cap memoire sur le nombre de samples charges en RAM
+    p.add_argument('--max-samples', type=int, default=None,
+                   help='cap memoire : nombre max de samples charges en RAM '
+                        'par tete. Default : auto (500k, ~4.4GB). '
+                        '0 = tout charger (16GB+ requis pour discard). '
+                        'Ex : --max-samples 400000 pour utiliser moins de RAM.')
+
     p.add_argument('--channels', type=int, default=256)
     p.add_argument('--n-blocks', type=int, default=16)
     p.add_argument('--binary-hidden', type=int, default=256)
     args = p.parse_args()
     train(args)
+
 
 if __name__ == '__main__':
     main()
