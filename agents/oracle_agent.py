@@ -12,7 +12,7 @@ autres à zéro). C'est ce qui permet de déployer l'agent sans info parfaite.
 import numpy as np
 import torch
 import torch.nn as nn
-
+import os
 from mahjong_ai.agents.suphx_cnn import (
     build_model, N_CHANNELS, ORACLE_DIM, IN_CHANNELS_ORACLE,
 )
@@ -33,39 +33,67 @@ class Critic(nn.Module):
 
 
 class OracleDiscardAgent:
-    """Policy (discard) + critic + SL figés (riichi/chow/pong/kong)."""
+    """Policy (discard) + critic + SL figés (riichi/chow/pong/kong).
 
+    [FIX 2026-10-14] L'architecture est lue depuis la config sauvegardee
+    dans chaque checkpoint (train_policy_sl.py stocke {'config': ...})
+    au lieu des defauts de build_model. Sans ca :
+    - les tetes legeres (128 canaux / 6 blocs) ne chargent pas ;
+    - la policy RL (defaut 16 blocs) ne warm-start que partiellement
+      depuis un SL a 12 blocs -- les blocs 12-15 restent aleatoires.
+    """
     def __init__(self, sl_discard_path, sl_frozen_dir, device='cpu',
                  policy_lr=1e-4, critic_lr=1e-3):
         self.device = device
 
-        # Policy avec canaux oracle
-        self.policy = build_model('discard', use_oracle=True).to(device)
-        ck = torch.load(sl_discard_path, map_location=device, weights_only=False)
-        # Charge partiellement (les 250 premiers canaux d'entrée matchent)
-        self._load_partial_sl(ck['model_state_dict'])
-        print(f"[oracle_agent] discard SL chargé (val_acc={ck.get('val_acc','?')})")
+        # --- Policy : archi lue depuis le checkpoint SL discard ---
+        ck = torch.load(sl_discard_path, map_location=device,
+                        weights_only=False)
+        cfg = ck.get('config', {}) if isinstance(ck, dict) else {}
+        channels = cfg.get('channels', 256)
+        n_blocks = cfg.get('n_blocks', 16)
 
-        # Critic
+        self.policy = build_model('discard', use_oracle=True,
+                                  channels=channels,
+                                  n_blocks=n_blocks).to(device)
+        self._load_partial_sl(ck['model_state_dict'])
+        print(f"[oracle_agent] discard SL charge "
+              f"(val_acc={ck.get('val_acc','?')}, "
+              f"arch={channels}x{n_blocks})", flush=True)
+
+        # --- Critic ---
         self.critic = Critic().to(device)
 
-        # SL figés
+        # --- SL figes : archi lue depuis CHAQUE checkpoint ---
         self.frozen_sl = {}
         for head in ['riichi', 'chow', 'pong', 'kong']:
-            path = f"{sl_frozen_dir}/{head}.pt"
+            path = os.path.join(sl_frozen_dir, f'{head}.pt')
             try:
-                m = build_model(head).to(device)
-                ck = torch.load(path, map_location=device, weights_only=False)
-                m.load_state_dict(ck['model_state_dict'])
+                hck = torch.load(path, map_location=device,
+                                 weights_only=False)
+                hcfg = hck.get('config', {}) if isinstance(hck, dict) else {}
+                m = build_model(
+                    head,
+                    channels=hcfg.get('channels', 256),
+                    n_blocks=hcfg.get('n_blocks', 16),
+                    binary_hidden=hcfg.get('binary_hidden', 256),
+                    in_channels=hcfg.get('in_channels', N_CHANNELS),
+                ).to(device)
+                m.load_state_dict(hck['model_state_dict'])
                 m.eval()
                 for p in m.parameters():
                     p.requires_grad = False
                 self.frozen_sl[head] = m
+                print(f"[oracle_agent] {head} charge "
+                      f"(arch={hcfg.get('channels','?')}x"
+                      f"{hcfg.get('n_blocks','?')})", flush=True)
             except Exception as e:
-                print(f"[oracle_agent] {head} non chargé : {e}")
+                print(f"[oracle_agent] {head} non charge : {e}", flush=True)
 
-        self.policy_optim = torch.optim.Adam(self.policy.parameters(), lr=policy_lr)
-        self.critic_optim = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
+        self.policy_optim = torch.optim.Adam(self.policy.parameters(),
+                                             lr=policy_lr)
+        self.critic_optim = torch.optim.Adam(self.critic.parameters(),
+                                             lr=critic_lr)
 
     def _load_partial_sl(self, state_dict):
         """Charge partiellement : le trunk (conv_in) attend 386 canaux mais

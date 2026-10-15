@@ -42,16 +42,24 @@ def worker_loop(worker_id, state, lock, buffer_data, buffer_max,
     predictor_holder = PredictorHolder()
     if grp_path is not None:
         try:
-            grp = RewardPredictor(input_dim=FEATURE_DIM, hidden_dim=128,
-                                    num_layers=2).to(device)
             ck = torch.load(grp_path, map_location=device, weights_only=False)
-            grp.load_state_dict(ck)
+            # [FIX] Le checkpoint est un dict avec metadonnees (train_grp_sl.py
+            # sauvegarde {'model_state_dict': ..., 'hidden_dim': ...}) --
+            # extraire le state_dict et lire l'archi depuis le checkpoint
+            # plutot que la hardcoder.
+            state = ck.get("model_state_dict", ck)
+            hidden_dim = ck.get("hidden_dim", 64)
+            input_dim = ck.get("feature_dim", FEATURE_DIM)
+            grp = RewardPredictor(input_dim=input_dim, hidden_dim=hidden_dim,
+                                num_layers=2).to(device)
+            grp.load_state_dict(state)
             grp.eval()
             predictor_holder.model = grp
-            print(f"[worker {worker_id}] GRP charge", flush=True)
+            print(f"[worker {worker_id}] GRP charge "
+                f"(hidden={hidden_dim}, val_loss={ck.get('val_loss', '?')})",
+                flush=True)
         except Exception as e:
             print(f"[worker {worker_id}] GRP load error : {e}", flush=True)
-
     # --- GameEnv 4-round East ---
     env = GameEnv(seed=worker_id, predictor_holder=predictor_holder,
                   game_log_buffer=None, n_rounds=4,

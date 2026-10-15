@@ -53,16 +53,21 @@ class ParameterServer:
 # les proxies (dict, lock), pas l'objet ParameterServer.
 # ---------------------------------------------------------------------- #
 def fetch_from_state(state, lock):
-    """Version picklable de fetch() : prend le dict et le lock en argument."""
-    with lock:
-        return (
-            state['policy_state'],
-            state['critic_state'],
-            state['step'],
-            state['alpha'],
-            state['gamma_t'],
-        )
+    """Version picklable de fetch() : prend le dict et le lock en argument.
 
+    [FIX 2026-10-14] Les workers demarrent avant la premiere publication
+    et (selon le chemin de creation du state) potentiellement avant son
+    initialisation. Retourner des valeurs par defaut au lieu de crasher :
+    le worker gere deja policy_state is None (tourne sur la policy locale
+    warm-startee jusqu'a la premiere publication).
+    """
+    with lock:
+        policy_state = state.get('policy_state')
+        critic_state = state.get('critic_state')
+        step = state.get('step', 0)
+        alpha = state.get('alpha', 0.01)
+        gamma_t = state.get('gamma_t', 1.0)
+        return (policy_state, critic_state, step, alpha, gamma_t)
 
 def publish_to_state(state, lock, policy_state, critic_state,
                       step, alpha, gamma_t):

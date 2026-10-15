@@ -203,7 +203,7 @@ class GameEnv:
             gap_last = self.game_scores[p] - min(self.game_scores)
             feat = np.array([
                 real_round_rewards[p],
-                self.game_scores[p],
+                self.game_scores[p] + 25.0,  # [REPLACE] etait score relatif
                 is_dealer_flag[p],
                 rounds_remaining_abs / 8.0,  # [REPLACE] etait progression
                 riichi_flags[p],
