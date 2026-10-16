@@ -20,7 +20,7 @@ import time
 
 import numpy as np
 import torch
-
+from mahjong_ai.envs.suphx_features import N_CHANNELS
 from mahjong_ai.envs.multi_agent import DISCARD
 
 
@@ -35,8 +35,18 @@ def load_sl_weak(weak_dir, device='cpu'):
         path = os.path.join(weak_dir, f'{h}.pt')
         if not os.path.isfile(path):
             raise FileNotFoundError(f"SL-weak manquant : {path}")
-        m = build_model(h).to(device)
         ck = torch.load(path, map_location=device, weights_only=False)
+        # [FIX] Architecture lue depuis la config du checkpoint
+        # (les tetes light sont en 128 canaux / 6 blocs -- les defauts
+        # de build_model sont 256/16 et provoquent un size mismatch).
+        cfg = ck.get('config', {}) if isinstance(ck, dict) else {}
+        m = build_model(
+            h,
+            channels=cfg.get('channels', 256),
+            n_blocks=cfg.get('n_blocks', 16),
+            binary_hidden=cfg.get('binary_hidden', 256),
+            in_channels=cfg.get('in_channels', N_CHANNELS),
+        ).to(device)
         m.load_state_dict(ck['model_state_dict'])
         m.eval()
         for p in m.parameters():
@@ -46,29 +56,24 @@ def load_sl_weak(weak_dir, device='cpu'):
 
 
 class SLWeakAgent:
-    """Wrapper SL-weak : joue les 4 sieges avec les 5 modeles SL-weak.
-
-    Seul le discard est utilise pour la decision. Les 4 tetes figees
-    (riichi/chow/pong/kong) sont passees a l'environnement via self.frozen.
-    """
-
     def __init__(self, weak_dir, device='cpu'):
         self.models = load_sl_weak(weak_dir, device)
         self.device = device
         self.frozen = {h: self.models[h] for h in
                         ['riichi', 'chow', 'pong', 'kong']}
 
-    def act(self, obs_normal, mask):
-        """Retourne l'action discard a partir de l'obs et du mask."""
-        obs_t = torch.as_tensor(obs_normal, dtype=torch.float32,
-                                 device=self.device).unsqueeze(0)
+    def act(self, obs_normal, obs_oracle=None, mask=None):
+        """[FIX] Signature uniformisee avec RLAgent.act(obs, oracle, mask).
+        Le SL-weak ignore l'oracle -- il joue sur l'obs normale seule."""
+        on = torch.as_tensor(obs_normal, dtype=torch.float32,
+                              device=self.device).unsqueeze(0)
         mask_t = torch.as_tensor(mask, dtype=torch.float32,
                                   device=self.device).unsqueeze(0)
         with torch.no_grad():
-            logits = self.models['discard'](obs_t)
+            logits = self.models['discard'](on)
             masked = logits + (mask_t - 1.0) * 1e9
         return int(masked.argmax(dim=-1).item())
-        
+
 class RLAgent:
     def __init__(self, checkpoint, sl_discard, sl_frozen, device='cpu'):
         from mahjong_ai.agents.oracle_agent import OracleDiscardAgent
@@ -165,7 +170,7 @@ def _play_one_game(eval_agent, weak_agent, env, eval_seat=0):
             if seat == eval_seat:
                 action = eval_agent.act(req['obs'], req['oracle'], req['mask'])
             else:
-                action = weak_agent.act(req['obs'], req['mask'])
+                action = weak_agent.act(req['obs'], req['oracle'], req['mask'])
 
         result = env.step(action)
 

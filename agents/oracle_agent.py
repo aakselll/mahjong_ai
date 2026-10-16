@@ -141,35 +141,81 @@ class OracleDiscardAgent:
         return logits, value, delta
 
     # ------------------------------------------------------------------ #
-    def select_action(self, obs_normal, obs_oracle, mask, gamma_t,
-                       deterministic=False):
-        """Forward + sample pour la collecte."""
+    def select_action(self, obs_normal, obs_oracle, mask, gamma_t):
+        """Retourne (action, logp, value, masked_obs_oracle).
+        
+        [FIX ORACLE GUIDING] Le masque Bernoulli appliqué à l'oracle fait
+        partie de l'ETAT vu par la policy. Pour que l'importance sampling
+        soit correct (ratio = 1 quand les poids n'ont pas change), il faut
+        que l'evaluation utilise LE MEME masque que la generation.
+        
+        On retourne donc l'oracle MASQUE pour qu'il soit stocke dans la
+        transition et reutilise tel quel pendant l'entrainement.
+        """
         on = torch.as_tensor(obs_normal, dtype=torch.float32,
-                              device=self.device).unsqueeze(0)
+                            device=self.device).unsqueeze(0)
         oo = torch.as_tensor(obs_oracle, dtype=torch.float32,
-                              device=self.device).unsqueeze(0)
-        m = torch.as_tensor(mask, dtype=torch.float32,
-                             device=self.device).unsqueeze(0)
-        logits, value, _ = self.forward_with_dropout(on, oo, gamma_t)
-        masked = logits + (m - 1.0) * 1e9
-        dist = torch.distributions.Categorical(logits=masked)
-        a = torch.argmax(masked, -1) if deterministic else dist.sample()
-        return (int(a.item()),
-                float(dist.log_prob(a).item()),
-                float(value.item()),
-                float(dist.entropy().item()))
+                            device=self.device).unsqueeze(0)
+        mask_t = torch.as_tensor(mask, dtype=torch.float32,
+                                device=self.device).unsqueeze(0)
+
+        # Appliquer le dropout Bernoulli per-element
+        if gamma_t < 1.0:
+            dropout = torch.bernoulli(
+                torch.full_like(oo, gamma_t))
+            oo_masked = oo * dropout
+        else:
+            oo_masked = oo
+
+        x = torch.cat([on, oo_masked], dim=1)
+        with torch.no_grad():
+            logits = self.policy(x)
+            masked_logits = logits + (mask_t - 1.0) * 1e9
+            dist = torch.distributions.Categorical(logits=masked_logits)
+            action = dist.sample()
+            logp = dist.log_prob(action)
+            
+            # Critic (inutilise avec value_coef=0 mais garde pour compat)
+            value = self.critic(x).item()
+
+        # [FIX] Retourner l'oracle MASQUE (pas le brut)
+        masked_obs_oracle = oo_masked.squeeze(0).cpu().numpy()
+        
+        return int(action.item()), logp.item(), value, masked_obs_oracle
 
     # ------------------------------------------------------------------ #
-    def evaluate_actions(self, obs_normal, obs_oracle, masks, actions,
-                          gamma_t):
-        """Batch forward pour l'update. gamma_t controle le dropout."""
-        logits, values, _ = self.forward_with_dropout(obs_normal, obs_oracle,
-                                                        gamma_t)
-        masked = logits + (masks - 1.0) * 1e9
-        dist = torch.distributions.Categorical(logits=masked)
+    def evaluate_actions(self, obs_n, obs_o, masks, actions, gamma_t):
+        """Evalue les log-probs des actions sous la policy courante.
+        
+        [FIX ORACLE GUIDING] obs_o est DEJA MASQUE (stocke depuis la
+        generation). On ne re-applique PAS de nouveau dropout -- sinon le
+        ratio d'importance sampling serait faux (memes poids != ratio 1
+        car les entrees different).
+        
+        gamma_t est garde en parametre pour compatibilite mais IGNORE :
+        le masque est deja "bake in" dans obs_o.
+        """
+        on = torch.as_tensor(obs_n, dtype=torch.float32,
+                            device=self.device)
+        oo = torch.as_tensor(obs_o, dtype=torch.float32,
+                            device=self.device)
+        # [FIX] PAS de nouveau dropout -- obs_o est deja masque
+        x = torch.cat([on, oo], dim=1)
+        
+        logits = self.policy(x)
+        mask_t = torch.as_tensor(masks, dtype=torch.float32,
+                                device=self.device)
+        masked_logits = logits + (mask_t - 1.0) * 1e9
+        dist = torch.distributions.Categorical(logits=masked_logits)
         logp = dist.log_prob(actions)
-        entropy = dist.entropy()
-        return logp, values, entropy
+        
+        values = self.critic(x)
+        # Entropie sur les actions valides
+        log_probs = torch.log_softmax(masked_logits, dim=-1)
+        probs = torch.exp(log_probs)
+        entropy = -(probs * log_probs).sum(dim=-1)
+        
+        return logp, values.squeeze(-1), entropy
 
     # ------------------------------------------------------------------ #
     def save(self, path, step=None, alpha=None):

@@ -6,28 +6,55 @@ MultiAgentMahjongEnv (single round).
 qu'une "partie" etait en realite UNE seule manche. Maintenant : 4 rounds
 East 1-4 + repeat dealer + GRP reward.
 
-[STATS] Ajout d'un stats_proxy partage (Manager dict) qui accumule les
-statistiques de jeu (rangs, longueur, outcomes).
+[NIVEAU 2 / FIX IPC 2026-10-14] Les transitions passent par une mp.Queue
+    au lieu d'une liste proxy Manager :
+    - l'ancien chemin tuait le serveur Manager sous Windows (~75 min
+      observes) ;
+    - la Queue est le mecanisme prevu pour le transfert de donnees
+      volumineuses (pipes dedies, backpressure via maxsize) ;
+    - put(timeout=30) : si le trainer est mort, le worker s'arrete
+      proprement au lieu de bloquer indefiniment sur une Queue pleine.
+
+    Signature changee vs Niveau 1 : (buffer_data, buffer_max) ->
+    transitions_queue. Le trainer passe la Queue en 4e argument.
+
+[STATS] stats_proxy partage (Manager dict) qui accumule les statistiques
+    de jeu (rangs, longueur, outcomes). Volume leger, frequence moderee :
+    reste tolerable pour le Manager.
 """
+import os
 import time
+
 import numpy as np
 import torch
-import os
 
 from mahjong_ai.training.game_env import GameEnv, PredictorHolder
 from mahjong_ai.agents.oracle_agent import OracleDiscardAgent
 from mahjong_ai.training.parameter_server import fetch_from_state
-from mahjong_ai.training.replay_buffer import buffer_add
 from mahjong_ai.envs.multi_agent import DISCARD
 from mahjong_ai.agents.reward_predictor import RewardPredictor, FEATURE_DIM
 
 
-def worker_loop(worker_id, state, lock, buffer_data, buffer_max,
-                 stats_proxy,                    # <-- NOUVEAU
-                 sl_discard_path, sl_frozen_dir,
-                 grp_path=None,
-                 n_games_per_cycle=10, device='cpu'):
+def worker_loop(worker_id, state, lock, transitions_queue,
+                stats_proxy,
+                sl_discard_path, sl_frozen_dir,
+                grp_path=None,
+                n_games_per_cycle=10, device='cpu'):
+    """
+    [NIVEAU 2] Les transitions passent par une mp.Queue au lieu d'une
+    liste proxy Manager.
 
+    Args :
+        worker_id          : id du worker (pour logs + seed GameEnv)
+        state, lock        : proxies Manager du parameter server
+        transitions_queue  : mp.Queue partagee avec le trainer
+        stats_proxy        : proxy Manager dict pour les stats de jeu
+        sl_discard_path    : chemin du checkpoint SL discard (warm-start)
+        sl_frozen_dir      : dossier des tetes SL gelees
+        grp_path           : chemin du checkpoint GRP (optionnel)
+        n_games_per_cycle  : parties jouees avant re-sync des poids
+        device             : cpu
+    """
     # [FIX] Limite les threads PyTorch par worker pour eviter
     # l'oversubscription.
     n_workers_total = int(os.environ.get("RL_N_WORKERS", "1"))
@@ -43,29 +70,27 @@ def worker_loop(worker_id, state, lock, buffer_data, buffer_max,
     if grp_path is not None:
         try:
             ck = torch.load(grp_path, map_location=device, weights_only=False)
-            # [FIX] Le checkpoint est un dict avec metadonnees (train_grp_sl.py
-            # sauvegarde {'model_state_dict': ..., 'hidden_dim': ...}) --
-            # extraire le state_dict et lire l'archi depuis le checkpoint
-            # plutot que la hardcoder.
-            state = ck.get("model_state_dict", ck)
+            # [FIX] Le checkpoint est un dict avec metadonnees -- extraire
+            # le state_dict et lire l'archi dedans (hidden_dim=64 sauvegarde,
+            # ne pas hardcoder 128).
+            state_dict = ck.get("model_state_dict", ck)
             hidden_dim = ck.get("hidden_dim", 64)
             input_dim = ck.get("feature_dim", FEATURE_DIM)
             grp = RewardPredictor(input_dim=input_dim, hidden_dim=hidden_dim,
-                                num_layers=2).to(device)
-            grp.load_state_dict(state)
+                                  num_layers=2).to(device)
+            grp.load_state_dict(state_dict)
             grp.eval()
             predictor_holder.model = grp
-            print(f"[worker {worker_id}] GRP charge "
-                f"(hidden={hidden_dim}, val_loss={ck.get('val_loss', '?')})",
-                flush=True)
+            print(f"[worker {worker_id}] GRP charge (hidden={hidden_dim}, "
+                  f"val_loss={ck.get('val_loss', '?')})", flush=True)
         except Exception as e:
             print(f"[worker {worker_id}] GRP load error : {e}", flush=True)
+
     # --- GameEnv 4-round East ---
     env = GameEnv(seed=worker_id, predictor_holder=predictor_holder,
                   game_log_buffer=None, n_rounds=4,
                   game_format="tonpuu")
     env.round_env.frozen_sl = agent.frozen_sl
-
     print(f"[worker {worker_id}] demarre (n_rounds=4)", flush=True)
 
     while True:
@@ -81,61 +106,75 @@ def worker_loop(worker_id, state, lock, buffer_data, buffer_max,
         for _ in range(n_games_per_cycle):
             transitions, game_stats = _play_one_game(env, agent, gamma_t)
             if transitions:
-                buffer_add(buffer_data, buffer_max, transitions)
+                # [NIVEAU 2] put au lieu de buffer_add.
+                # timeout : ne pas bloquer indefiniment si le trainer est
+                # mort (Queue pleine -> exception -> arret propre).
+                try:
+                    transitions_queue.put(transitions, timeout=30.0)
+                except Exception:
+                    print(f"[worker {worker_id}] Queue indisponible -- "
+                          f"arret du worker", flush=True)
+                    return
             # [STATS] mise a jour du proxy partage
             if game_stats is not None:
                 _update_stats(stats_proxy, lock, game_stats)
 
-        time.sleep(0.01)
-
 
 def _update_stats(stats_proxy, lock, game_stats):
-    """Met a jour le proxy de stats apres une partie.
+    """Accumule les stats d'une partie dans le proxy partage.
 
-    Utilise le meme lock que le parameter server pour eviter la contention.
-    Chaque compteur est lu et ecrit sous le lock pour l'atomicite.
+    [FIX 2026-10-14] Aligne sur le format REEL de _play_one_game :
+      - rang          : cle 'rank_of_seat0' (pas 'rank')
+      - outcomes      : compteurs CUMULES par partie (n_tsumo/n_ron/
+                        n_exhaustive/n_abortive somment les manches),
+                        pas une cle 'outcome' unique
+      - n_rounds/n_honba : cles deja correctes
     """
-    rank = game_stats['rank_of_seat0']
-    rank_key = (f'n_{rank}st' if rank == 1 else
-                 f'n_{rank}nd' if rank == 2 else
-                 f'n_{rank}rd' if rank == 3 else 'n_4th')
+    if game_stats is None:
+        return
     with lock:
         stats_proxy['n_games'] = stats_proxy.get('n_games', 0) + 1
-        stats_proxy[rank_key] = stats_proxy.get(rank_key, 0) + 1
+        rank = game_stats.get('rank_of_seat0', 0)
+        if rank == 1:
+            stats_proxy['n_1st'] = stats_proxy.get('n_1st', 0) + 1
+        elif rank == 2:
+            stats_proxy['n_2nd'] = stats_proxy.get('n_2nd', 0) + 1
+        elif rank == 3:
+            stats_proxy['n_3rd'] = stats_proxy.get('n_3rd', 0) + 1
+        elif rank == 4:
+            stats_proxy['n_4th'] = stats_proxy.get('n_4th', 0) + 1
         stats_proxy['sum_rank'] = stats_proxy.get('sum_rank', 0.0) + rank
-        stats_proxy['n_rounds_total'] = (
-            stats_proxy.get('n_rounds_total', 0) + game_stats['n_rounds'])
-        stats_proxy['n_honba_total'] = (
-            stats_proxy.get('n_honba_total', 0) + game_stats['n_honba'])
-        stats_proxy['n_tsumo'] = (
-            stats_proxy.get('n_tsumo', 0) + game_stats['n_tsumo'])
-        stats_proxy['n_ron'] = (
-            stats_proxy.get('n_ron', 0) + game_stats['n_ron'])
-        stats_proxy['n_exhaustive'] = (
-            stats_proxy.get('n_exhaustive', 0) + game_stats['n_exhaustive'])
-        stats_proxy['n_abortive'] = (
-            stats_proxy.get('n_abortive', 0) + game_stats['n_abortive'])
-
+        stats_proxy['n_rounds_total'] = stats_proxy.get('n_rounds_total', 0) \
+            + game_stats.get('n_rounds', 0)
+        stats_proxy['n_honba_total'] = stats_proxy.get('n_honba_total', 0) \
+            + game_stats.get('n_honba', 0)
+        # [FIX] Outcomes : compteurs cumules par manche dans la partie --
+        # on ajoute directement les compteurs de la partie.
+        stats_proxy['n_tsumo'] = stats_proxy.get('n_tsumo', 0) \
+            + game_stats.get('n_tsumo', 0)
+        stats_proxy['n_ron'] = stats_proxy.get('n_ron', 0) \
+            + game_stats.get('n_ron', 0)
+        stats_proxy['n_exhaustive'] = stats_proxy.get('n_exhaustive', 0) \
+            + game_stats.get('n_exhaustive', 0)
+        stats_proxy['n_abortive'] = stats_proxy.get('n_abortive', 0) \
+            + game_stats.get('n_abortive', 0)
 
 def _play_one_game(env, agent, gamma_t):
     """Joue une partie COMPLETE (4 rounds + repeats).
 
-    [FIX 2025-XX] Reward de la manche k attribue a la DERNIERE transition
-    du siege DANS LA MANCHE k.
-
-    [FIX 2025-XX-2] Tracking de max_honba (le honba final est souvent 0
-    apres un dernier round non-repeat). On prend le maximum atteint
-    pendant la partie pour les stats.
-
-    Retourne (transitions, stats) ou stats est un dict des stats de la
-    partie.
+    [FIX MULTI-SEAT REWARD] Le reward de la manche k est attribue a
+    TOUTES les transitions du siege dans cette manche (papier : "assign
+    it to each state-action pair in round k"). L'ancien code ne
+    l'assignait qu'a la DERNIERE transition -- 98 pourcent des
+    transitions avaient reward=0, diluant le signal d'apprentissage par
+    ~50x.
     """
     transitions = []
     pending_reward = {s: 0.0 for s in range(4)}
-    last_idx_per_seat = {s: None for s in range(4)}
+    # [FIX] Tous les indices par siege pour la manche courante
+    round_indices_per_seat = {s: [] for s in range(4)}
     max_honba = 0
 
-    # [STATS] Compteurs locaux
     stats = {
         'n_rounds': 0,
         'n_tsumo': 0,
@@ -155,7 +194,7 @@ def _play_one_game(env, agent, gamma_t):
             obs_n = req['obs']
             obs_o = req['oracle']
             mask = req['mask']
-            action, logp, value, _ = agent.select_action(
+            action, logp, value, masked_obs_o = agent.select_action(
                 obs_n, obs_o, mask, gamma_t)
 
         result = env.step(action)
@@ -164,19 +203,18 @@ def _play_one_game(env, agent, gamma_t):
             transitions.append({
                 'seat': seat,
                 'obs_normal': obs_n,
-                'obs_oracle': obs_o,
+                'obs_oracle': masked_obs_o,
                 'mask': mask,
                 'action': action,
                 'logp': logp,
                 'value': value,
-                'reward': pending_reward[seat],
+                'reward': 0.0,          # [FIX] rempli a la fin de la manche
                 'done': False,
             })
-            pending_reward[seat] = 0.0
-            last_idx_per_seat[seat] = len(transitions) - 1
+            # [FIX] Enregistrer TOUTES les transitions du siege
+            round_indices_per_seat[seat].append(len(transitions) - 1)
 
         if result['round_done']:
-            # [STATS] categorisation du outcome
             outcome = result.get('outcome', 'unknown')
             if outcome == 'tsumo':
                 stats['n_tsumo'] += 1
@@ -188,26 +226,28 @@ def _play_one_game(env, agent, gamma_t):
                 stats['n_abortive'] += 1
             stats['n_rounds'] += 1
 
-            # [FIX] Tracker le honba max atteint pendant la partie.
-            # env.honba est incremente dans GameEnv.step() a la fin
-            # de la manche si le dealer repeat.
             max_honba = max(max_honba, env.honba)
 
+            # [FIX] Attribuer le reward de la manche a TOUTES les
+            # transitions de chaque siege dans cette manche
             round_rewards = result['final_rewards']
             for s in range(4):
                 reward_s = round_rewards.get(s, 0.0)
                 reward_s = max(-20.0, min(20.0, reward_s))
                 if reward_s == 0.0:
                     continue
-                idx = last_idx_per_seat[s]
-                if idx is not None:
+                # [FIX] Boucle sur TOUS les indices du siege,
+                # pas seulement le dernier
+                for idx in round_indices_per_seat[s]:
                     transitions[idx]['reward'] += reward_s
-                else:
+                if not round_indices_per_seat[s]:
                     pending_reward[s] += reward_s
 
-            last_idx_per_seat = {s: None for s in range(4)}
+            # [FIX] Reset pour la prochaine manche
+            round_indices_per_seat = {s: [] for s in range(4)}
 
             if result.get('game_done', False):
+                # Reward pending (siege sans action dans la derniere manche)
                 for s in range(4):
                     if pending_reward[s] != 0.0:
                         for t in reversed(transitions):
@@ -223,12 +263,11 @@ def _play_one_game(env, agent, gamma_t):
     if transitions:
         transitions[-1]['done'] = True
 
-    # [STATS] Calcul du rang final de seat 0
-    scores = env.game_scores   # list de 4 floats (par siege REEL)
+    scores = env.game_scores
     order = sorted(range(4), key=lambda p: (-scores[p], p))
     rank_of_seat0 = order.index(0) + 1
 
     stats['rank_of_seat0'] = rank_of_seat0
-    stats['n_honba'] = max_honba    # <-- FIX : max au lieu de env.honba
+    stats['n_honba'] = max_honba
 
     return transitions, stats

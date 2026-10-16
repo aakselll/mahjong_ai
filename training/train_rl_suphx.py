@@ -3,32 +3,57 @@ Boucle principale d'entrainement RL Suphx.
 
 [FIDELITE PAPIER §3.3] Oracle guiding en 3 phases :
     Phase 1 (oracle)     : gamma_t = 1 constant, LR normal
-    Phase 2 (dropout)    : gamma_t : 1 -> 0 lineaire, LR normal
+    Phase 2 (dropout)    : gamma_t : 1 -> 0 lineaire
     Phase 3 (normal)     : gamma_t = 0, LR / 10, IW rejection
 
-[FIX Windows spawn] Les workers recoivent UNIQUEMENT les proxies
-Manager (dict, lock, list) - pas les objets ParameterServer/ReplayBuffer
-qui contiennent le Manager (non picklable).
+[NIVEAU 2 / FIX IPC 2026-10-14] Les transitions passent par une mp.Queue
+    au lieu d'une liste proxy Manager :
+    - l'ancien chemin (4 workers ecrivant dans une ListProxy a chaque
+      partie) tuait le serveur Manager sous Windows au bout de ~75 min
+      de charge IPC ;
+    - la Queue est le mecanisme prevu pour le transfert volumineux
+      inter-processus (pipes dedies, backpressure via maxsize) ;
+    - le Manager ne porte plus que l'etat leger : poids de policy
+      publies, stats de jeu. Volume faible, frequence moderee.
 
-[STATS] Ajout d'un stats_proxy partage pour monitorer :
-    - win rate (rank de seat 0 sur N parties)
-    - distribution 1st/2nd/3rd/4th
-    - longueur moyenne des parties (rounds + honba)
-    - distribution des fins de manche (tsumo/ron/exh/abort)
+[FIX CRASH] try/except autour de la boucle d'entrainement avec
+    sauvegarde d'URGENCE des poids (step reel inclus). Si un crash IPC
+    ou autre survient a 300k steps, le run est recuperable via --resume
+    au lieu d'etre perdu integralement.
+
+[FIX ALPHA] Cap sur le coefficient d'entropie (--alpha-max, defaut 0.15).
+    Sans lui, quand H_target est inatteignable (une policy discard
+    competente plafonne a H~1.7), alpha croit sans fin : sur le run
+    600k precedent, alpha a fini a 0.41 et le bonus d'entropie dominait
+    la policy loss par ~7x -> policy aplatie -> deal-ins -> 34 pourcent
+    de 4es places contre 25 attendu (mean_rank 2.71 vs SL).
+    Le papier ne plafonne pas alpha mais couvre 25M steps ; a notre
+    echelle le cap est la protection necessaire. 0 = pas de cap.
+
+[FIX RESUME] agent.save(path, step=step) partout : le checkpoint contient
+    le step reel. Plus besoin du regex sur le nom de fichier pour le
+    retrouver au resume.
+
+[STATS] stats_proxy partage pour monitorer win rate, distribution de
+    rangs, longueur des parties, distribution des fins de manche.
 
 Usage :
     py -3.14 -m mahjong_ai.training.train_rl_suphx ^
-        --sl-discard checkpoints/sl_2015_run1/discard.pt ^
-        --sl-frozen checkpoints/sl_2015_run1 ^
-        --grp-checkpoint checkpoints/grp_sl_east4.pt ^
-        --total-steps 100000 --n-workers 4 ^
-        --output checkpoints/rl_discard.pt
+        --sl-discard checkpoints/sl_tonpusen_light/discard.pt ^
+        --sl-frozen checkpoints/sl_tonpusen_light ^
+        --grp-checkpoint checkpoints/grp_tonpusen.pt ^
+        --total-steps 500000 --n-workers 4 ^
+        --h-target 1.6 --alpha-max 0.15 --value-coef 0.0 ^
+        --oracle-frac 0.10 --transition-frac 0.30 ^
+        --save-every 25000 --keep-last-n 3 --publish-every 5000 ^
+        --output checkpoints/rl_tonpusen_v2/rl_discard.pt
 """
 import argparse
+import collections
 import multiprocessing as mp
 import os
+import threading
 import time
-import collections
 
 import numpy as np
 import torch
@@ -37,7 +62,6 @@ from mahjong_ai.agents.oracle_agent import OracleDiscardAgent
 from mahjong_ai.training.parameter_server import (
     ParameterServer, publish_to_state,
 )
-from mahjong_ai.training.replay_buffer import ReplayBuffer
 from mahjong_ai.training.self_play_worker import worker_loop
 
 
@@ -192,29 +216,35 @@ def get_phase_and_gamma(step, total_steps,
 # GAE
 # ---------------------------------------------------------------------- #
 def compute_advantages(transitions, gamma=0.99, lam=0.95):
-    gae = 0.0
-    next_v = 0.0
-    for t in reversed(range(len(transitions))):
-        tr = transitions[t]
-        if tr['done']:
-            next_v = 0.0
-            delta = tr['reward'] - tr['value']
-            gae = delta
-        else:
-            delta = tr['reward'] + gamma * next_v - tr['value']
-            gae = delta + gamma * lam * gae
-        tr['advantage'] = gae
-        tr['return'] = gae + tr['value']
-        next_v = tr['value']
-    advs = np.array([tr['advantage'] for tr in transitions], dtype=np.float32)
+    """[FIX MULTI-SEAT GAE] Remplace le GAE par la baseline batch-mean
+    du papier Suphx.
+
+    ANCIEN BUG : le GAE bootstrapait a travers des transitions
+    interlevees de 4 sieges differents. Entre deux transitions du MEME
+    siege, il y avait 3 transitions d'autres sieges dont les values
+    polluaient le TD-error. Les advantages resultant n'avaient aucune
+    signification -- le policy gradient etait du bruit pur des la phase 2
+    (quand l'agent doit apprendre sans oracle, il depend des advantages).
+
+    Le papier n'utilise PAS de GAE ni de critic :
+        A(s,a) = r_batch - mean(r_batch)
+    Cette formule est immunisee contre l'interleaving multi-sieges.
+    """
+    rewards = np.array([t['reward'] for t in transitions], dtype=np.float32)
+
+    # Baseline = moyenne du batch (papier, eq. informelle)
+    baseline = rewards.mean()
+    advs = rewards - baseline
+
+    # Normalisation (deja presente dans l'ancien code, garde)
     if len(advs) > 1 and advs.std() > 1e-6:
         advs = (advs - advs.mean()) / (advs.std() + 1e-8)
-        
-    for tr in transitions:
-        tr['return'] = max(-30.0, min(30.0, tr['return']))
+
+    for i, tr in enumerate(transitions):
+        tr['advantage'] = advs[i]
+        tr['return'] = tr['reward']   # pas de bootstrapping
+
     return advs
-
-
 
 # ---------------------------------------------------------------------- #
 # PG + IS loss
@@ -224,9 +254,9 @@ def pg_is_loss(agent, transitions, advantages, gamma_t,
     obs_n = torch.as_tensor(np.stack([t['obs_normal'] for t in transitions]),
                              dtype=torch.float32, device=agent.device)
     obs_o = torch.as_tensor(np.stack([t['obs_oracle'] for t in transitions]),
-                             dtype=torch.float32, device=agent.device)
+                            dtype=torch.float32, device=agent.device)
     masks = torch.as_tensor(np.stack([t['mask'] for t in transitions]),
-                             dtype=torch.float32, device=agent.device)
+                            dtype=torch.float32, device=agent.device)
     actions = torch.as_tensor([t['action'] for t in transitions],
                                 dtype=torch.long, device=agent.device)
     old_logp = torch.as_tensor([t['logp'] for t in transitions],
@@ -279,14 +309,55 @@ def train(args):
           f"transition={args.transition_frac*100:.0f}%, "
           f"normal={(1-args.oracle_frac-args.transition_frac)*100:.0f}%",
           flush=True)
+    print(f"[train_rl] alpha : init={args.alpha_init}, max={args.alpha_max}, "
+          f"h_target={args.h_target}, beta={args.beta}",
+          flush=True)
 
-    # --- Parameter server + buffer ---
+    # --- Parameter server (etat LEGER : poids, alpha, gamma) + Queue ---
     ps = ParameterServer()
-    rb = ReplayBuffer(max_size=args.buffer_size, manager=ps.manager)
-
-    # --- [STATS] Proxy partage pour les stats de jeu ---
     stats_proxy = ps.manager.dict()
     reset_stats_proxy(stats_proxy)
+
+    # [NIVEAU 2 / FIX IPC] Les transitions passent par une mp.Queue :
+    # mecanisme prevu pour le transfert volumineux inter-processus (pipes
+    # dedies + backpressure via maxsize). L'ancien chemin -- liste proxy
+    # Manager sollicitee par 4 workers a chaque partie -- tuait le serveur
+    # Manager sous Windows au bout de ~75 min de charge IPC. Le Manager ne
+    # porte plus desormais que l'etat leger (poids, stats).
+    transitions_queue = mp.Queue(maxsize=args.buffer_size)
+
+    # Buffer LOCAL au process principal : liste ordinaire protegee par un
+    # lock, remplie par un thread daemon qui draine la Queue.
+    rb_local = []
+    rb_lock = threading.Lock()
+
+    import queue as _queue_mod
+
+    def _drain_queue(q, rb_list, lock, buffer_max):
+        """Draine la Queue vers le buffer local (thread daemon).
+
+        get(timeout=1.0) : le thread verifie periodiquement s'il doit
+        s'arreter (Queue fermee en fin de run) sans polling actif.
+        """
+        while True:
+            try:
+                item = q.get(timeout=1.0)
+                with lock:
+                    rb_list.append(item)
+                    while len(rb_list) > buffer_max:
+                        rb_list.pop(0)
+            except _queue_mod.Empty:
+                continue
+            except Exception:
+                # Queue fermee (fin de run) ou pipe casse : arret propre.
+                return
+
+    drain_thread = threading.Thread(
+        target=_drain_queue,
+        args=(transitions_queue, rb_local, rb_lock, args.buffer_size),
+        daemon=True,
+    )
+    drain_thread.start()
 
     # --- Agent ---
     agent = OracleDiscardAgent(
@@ -310,7 +381,7 @@ def train(args):
             start_step = ck.get('step', 0) or 0
             start_alpha = ck.get('alpha', args.alpha_init) or args.alpha_init
 
-            # Extraction depuis le nom si step=0
+            # Extraction depuis le nom si step=0 (anciens checkpoints)
             if start_step == 0:
                 import re
                 m = re.search(r'step(\d+)', args.resume)
@@ -329,10 +400,10 @@ def train(args):
         ps.state, ps.lock,
         agent.policy.state_dict(),
         agent.critic.state_dict(),
-        step=0, alpha=args.alpha_init, gamma_t=1.0,
+        step=start_step, alpha=start_alpha, gamma_t=1.0,
     )
 
-    # --- Workers ---
+    # --- Workers : la Queue remplace la liste proxy ---
     workers = []
     for i in range(args.n_workers):
         p = mp.Process(
@@ -340,8 +411,8 @@ def train(args):
             args=(
                 i,
                 ps.state, ps.lock,
-                rb.data, args.buffer_size,
-                stats_proxy,                        # <-- NOUVEAU
+                transitions_queue,          # [NIVEAU 2] Queue au lieu de rb.data
+                stats_proxy,
                 args.sl_discard, args.sl_frozen,
                 args.grp_checkpoint,
                 args.games_per_cycle, device
@@ -363,171 +434,227 @@ def train(args):
     t_start = time.time()
     n_updates = 0
 
-    while step < args.total_steps:
-        if len(rb) < args.batch_episodes:
-            time.sleep(1.0)
-            continue
+    # [FIX CRASH] Chemin de base pour les sauvegardes (normales et
+    # d'urgence) -- calcule une fois, hors de la boucle.
+    base_out = args.output[:-3] if args.output.endswith('.pt') else args.output
 
-        batch = rb.sample(args.batch_episodes)
-        if batch is None:
-            continue
-        if len(batch) > args.max_batch_transitions:
-            idx = np.random.choice(len(batch), args.max_batch_transitions,
-                                    replace=False)
-            batch = [batch[i] for i in idx]
+    try:
+        while step < args.total_steps:
+            # [NIVEAU 2] Echantillonnage depuis le buffer local.
+            # [NIVEAU 2] Echantillonnage depuis le buffer local.
+            # [FIX FORMAT] rb_local contient des EPISODES (listes de
+            # transitions, comme l'ancien buffer). L'ancien
+            # ReplayBuffer.sample() aplatisait : [tr for ep in batch
+            # for tr in ep]. Le nouveau chemin Queue doit faire pareil --
+            # compute_advantages et pg_is_loss attendent une liste PLATE
+            # de dicts de transitions.
+            with rb_lock:
+                buf_len = len(rb_local)
+                if buf_len < args.batch_episodes:
+                    time.sleep(1.0)
+                    continue
+                idx = np.random.choice(
+                    buf_len, size=min(args.batch_episodes, buf_len),
+                    replace=False)
+                batch = [rb_local[i] for i in idx]
+            # Aplatissement episodes -> transitions (memes semantiques que
+            # l'ancien ReplayBuffer.sample : le done=True de fin de partie
+            # coupe correctement le bootstrap GAE entre episodes).
+            batch = [tr for ep in batch for tr in ep]
 
-        phase, gamma_t, lr_factor = get_phase_and_gamma(
-            step, args.total_steps, args.oracle_frac, args.transition_frac)
+            if not batch:
+                continue
+            if len(batch) > args.max_batch_transitions:
+                sub = np.random.choice(len(batch), args.max_batch_transitions,
+                                        replace=False)
+                batch = [batch[i] for i in sub]
 
-        # --- Changement de phase ---
-        if phase != current_phase:
-            print(f"[step {step:7d}] PHASE {current_phase} -> {phase} "
-                  f"(gamma={gamma_t:.3f}, lr_factor={lr_factor})",
-                  flush=True)
-            current_phase = phase
+            phase, gamma_t, lr_factor = get_phase_and_gamma(
+                step, args.total_steps, args.oracle_frac, args.transition_frac)
 
-            # Policy LR : base * lr_factor (1.0 en phase 2, 0.1 en phase 3)
-            for pg in agent.policy_optim.param_groups:
-                pg['lr'] = base_lr * lr_factor
+            # --- Changement de phase ---
+            if phase != current_phase:
+                print(f"[step {step:7d}] PHASE {current_phase} -> {phase} "
+                      f"(gamma={gamma_t:.3f}, lr_factor={lr_factor})",
+                      flush=True)
+                current_phase = phase
 
-            # Critic LR : on reduit independamment de la policy
-            #   phase 1 : 1.0  x critic_lr = 1e-2
-            #   phase 2 : 0.5  x critic_lr = 5e-3
-            #   phase 3 : 0.1  x critic_lr = 1e-3
-            critic_factor = {1: 1.0, 2: 0.5, 3: 0.1}[phase]
-            for pg in agent.critic_optim.param_groups:
-                pg['lr'] = args.critic_lr * critic_factor
+                # Policy LR : base * lr_factor (1.0 en phase 2, 0.1 en phase 3)
+                for pg in agent.policy_optim.param_groups:
+                    pg['lr'] = base_lr * lr_factor
 
-            # [STATS] reset pour mesurer par phase
-            reset_stats_proxy(stats_proxy)
-            print(f"[step {step}] stats reset pour phase {phase}",
-                  flush=True)
+                # Critic LR : reduction independante de la policy
+                critic_factor = {1: 1.0, 2: 0.5, 3: 0.1}[phase]
+                for pg in agent.critic_optim.param_groups:
+                    pg['lr'] = args.critic_lr * critic_factor
 
-        # --- Update ---
-        advantages = compute_advantages(batch, gamma=args.gamma, lam=args.lam)
+                # [STATS] reset pour mesurer par phase
+                reset_stats_proxy(stats_proxy)
+                print(f"[step {step}] stats reset pour phase {phase}",
+                      flush=True)
 
-        # Multi-epoch PPO : plusieurs passes de gradient par batch
-        PPO_EPOCHS = args.ppo_epochs
-        policy_loss_last = None
-        value_loss_last = None
-        entropy_last = None
+            # --- Update ---
+            advantages = compute_advantages(batch, gamma=args.gamma, lam=args.lam)
 
-        policy_gnorm_last = None
-        critic_gnorm_last = None
+            # Multi-epoch PPO : plusieurs passes de gradient par batch
+            PPO_EPOCHS = args.ppo_epochs
+            policy_loss_last = None
+            value_loss_last = None
+            entropy_last = None
+            policy_gnorm_last = None
+            critic_gnorm_last = None
 
-        for epoch_i in range(PPO_EPOCHS):
-            agent.policy_optim.zero_grad()
-            agent.critic_optim.zero_grad()
-            iw_thresh = args.iw_threshold if phase == 3 else None
-            policy_loss, value_loss, entropy = pg_is_loss(
-                agent, batch, advantages, gamma_t,
-                clip_eps=args.clip_eps, iw_threshold=iw_thresh, phase=phase)
-            if policy_loss is None:
-                break
-            loss = policy_loss + args.value_coef * value_loss - alpha * entropy
-            loss.backward()
-            # [FIX] capture les grad norms pour le log DRIFT
-            policy_gnorm_last = torch.nn.utils.clip_grad_norm_(
-                agent.policy.parameters(), 5.0)
-            critic_gnorm_last = torch.nn.utils.clip_grad_norm_(
-                agent.critic.parameters(), 5.0)
-            agent.policy_optim.step()
-            agent.critic_optim.step()
-            policy_loss_last = policy_loss
-            value_loss_last = value_loss
-            entropy_last = entropy
+            for epoch_i in range(PPO_EPOCHS):
+                agent.policy_optim.zero_grad()
+                agent.critic_optim.zero_grad()
+                iw_thresh = args.iw_threshold if phase == 3 else None
+                policy_loss, value_loss, entropy = pg_is_loss(
+                    agent, batch, advantages, gamma_t,
+                    clip_eps=args.clip_eps, iw_threshold=iw_thresh, phase=phase)
+                if policy_loss is None:
+                    break
+                loss = policy_loss + args.value_coef * value_loss - alpha * entropy
+                loss.backward()
+                policy_gnorm_last = torch.nn.utils.clip_grad_norm_(
+                    agent.policy.parameters(), 5.0)
+                critic_gnorm_last = torch.nn.utils.clip_grad_norm_(
+                    agent.critic.parameters(), 5.0)
+                agent.policy_optim.step()
+                agent.critic_optim.step()
+                policy_loss_last = policy_loss
+                value_loss_last = value_loss
+                entropy_last = entropy
 
-        if policy_loss_last is None:
-            continue
-        policy_loss = policy_loss_last
-        value_loss = value_loss_last
-        entropy = entropy_last
-        policy_gnorm = policy_gnorm_last if policy_gnorm_last is not None \
-            else torch.tensor(0.0)
-        critic_gnorm = critic_gnorm_last if critic_gnorm_last is not None \
-            else torch.tensor(0.0)
+            if policy_loss_last is None:
+                continue
+            policy_loss = policy_loss_last
+            value_loss = value_loss_last
+            entropy = entropy_last
+            policy_gnorm = policy_gnorm_last if policy_gnorm_last is not None \
+                else torch.tensor(0.0)
+            critic_gnorm = critic_gnorm_last if critic_gnorm_last is not None \
+                else torch.tensor(0.0)
 
-        if policy_loss_last is None:
-            continue
-        policy_loss = policy_loss_last
-        value_loss = value_loss_last
-        entropy = entropy_last
+            step += len(batch)
+            n_updates += 1
 
-        step += len(batch)
-        n_updates += 1
+            # --- Alpha (Eq. 3) avec CAP [FIX ALPHA] ---
+            recent_entropies.append(entropy.item())
+            if len(recent_entropies) > 50:
+                recent_entropies.pop(0)
+            if len(recent_entropies) >= 3:
+                h_bar = np.mean(recent_entropies)
+                # [FIX ALPHA] Cap : sans lui, alpha monte sans fin quand
+                # H_target est inatteignable (policy discard competente
+                # plafonne a H~1.7). Run 600k precedent : alpha=0.41 final,
+                # bonus d'entropie ~7x la policy loss -> policy aplatie ->
+                # 34 pourcent de 4es places contre 25 attendu.
+                raw_update = alpha + args.beta * (args.h_target - h_bar)
+                if args.alpha_max > 0:
+                    alpha = max(0.0, min(raw_update, args.alpha_max))
+                else:
+                    alpha = max(0.0, raw_update)   # comportement papier
 
-        # --- Alpha (Eq. 3) ---
-        recent_entropies.append(entropy.item())
-        if len(recent_entropies) > 50:
-            recent_entropies.pop(0)
-        if len(recent_entropies) >= 3:
-            h_bar = np.mean(recent_entropies)
-            alpha = max(0.0, alpha + args.beta * (args.h_target - h_bar))
-
-        # --- Publish ---
-        if step % args.publish_every < len(batch):
-            publish_to_state(
-                ps.state, ps.lock,
-                agent.policy.state_dict(),
-                agent.critic.state_dict(),
-                step=step, alpha=alpha, gamma_t=gamma_t,
-            )
-
-        # --- Log + Drift + GAME stats ---
-        if step % args.log_every < len(batch):
-            elapsed = time.time() - t_start
-            metrics = compute_drift_metrics(batch)
-            alerts = check_drift_alerts(metrics, phase)
-
-            print(f"[step {step:7d} | phase {phase}] "
-                  f"pl={policy_loss.item():+.4f} "
-                  f"vl={value_loss.item():.4f} "
-                  f"H={entropy.item():.4f} "
-                  f"alpha={alpha:.4f} "
-                  f"gamma={gamma_t:.3f} "
-                  f"buf={len(rb)} "
-                  f"({elapsed:.0f}s)", flush=True)
-
-            if metrics is not None:
-                print(
-                    f"    | DRIFT: "
-                    f"act_H={metrics['action_entropy']:.2f} "
-                    f"act_div={metrics['action_div']:.2f} "
-                    f"adv_abs={metrics['adv_abs_mean']:.2f} "
-                    f"adv_std={metrics['adv_std']:.2f} "
-                    f"val_std={metrics['val_std']:.2f} "
-                    f"val_mean={metrics['val_mean']:+.2f} "
-                    f"ret_mean={metrics['ret_mean']:+.2f} "
-                    f"| top3=[{metrics['actions_top3']}] "
-                    f"pgn={policy_gnorm.item():.2f} "
-                    f"cgn={critic_gnorm.item():.2f}",
-                    flush=True,
+            # --- Publish ---
+            if step % args.publish_every < len(batch):
+                publish_to_state(
+                    ps.state, ps.lock,
+                    agent.policy.state_dict(),
+                    agent.critic.state_dict(),
+                    step=step, alpha=alpha, gamma_t=gamma_t,
                 )
 
-            # [STATS] Ligne GAME
-            game_line = format_game_stats(stats_proxy)
-            if game_line is not None:
-                print(f"    | GAME: {game_line}", flush=True)
+            # --- Log + Drift + GAME stats ---
+            if step % args.log_every < len(batch):
+                with rb_lock:
+                    current_buf = len(rb_local)
+                elapsed = time.time() - t_start
+                metrics = compute_drift_metrics(batch)
+                alerts = check_drift_alerts(metrics, phase)
 
-            for a in alerts:
-                print(f"    | !! {a}", flush=True)
+                print(f"[step {step:7d} | phase {phase}] "
+                      f"pl={policy_loss.item():+.4f} "
+                      f"vl={value_loss.item():.4f} "
+                      f"H={entropy.item():.4f} "
+                      f"alpha={alpha:.4f} "
+                      f"gamma={gamma_t:.3f} "
+                      f"buf={current_buf} "
+                      f"({elapsed:.0f}s)", flush=True)
 
+                if metrics is not None:
+                    print(
+                        f"    | DRIFT: "
+                        f"act_H={metrics['action_entropy']:.2f} "
+                        f"act_div={metrics['action_div']:.2f} "
+                        f"adv_abs={metrics['adv_abs_mean']:.2f} "
+                        f"adv_std={metrics['adv_std']:.2f} "
+                        f"val_std={metrics['val_std']:.2f} "
+                        f"val_mean={metrics['val_mean']:+.2f} "
+                        f"ret_mean={metrics['ret_mean']:+.2f} "
+                        f"| top3=[{metrics['actions_top3']}] "
+                        f"pgn={policy_gnorm.item():.2f} "
+                        f"cgn={critic_gnorm.item():.2f}",
+                        flush=True,
+                    )
 
-        if step % args.save_every < len(batch):
+                # [STATS] Ligne GAME
+                game_line = format_game_stats(stats_proxy)
+                if game_line is not None:
+                    print(f"    | GAME: {game_line}", flush=True)
+
+                for a in alerts:
+                    print(f"    | !! {a}", flush=True)
+
+            if step % args.save_every < len(batch):
+                os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
+                step_path = f"{base_out}_step{step:07d}.pt"
+                latest_path = f"{base_out}_latest.pt"
+                # [FIX RESUME] step passe au save -> le checkpoint contient
+                # le step reel, plus besoin du regex sur le nom.
+                agent.save(step_path, step=step)
+                agent.save(latest_path, step=step)
+                if args.keep_last_n > 0:
+                    _purge_old_checkpoints(base_out, args.keep_last_n)
+                print(f"[step {step}] save {step_path} + {latest_path}",
+                      flush=True)
+
+    except (BrokenPipeError, ConnectionError, ConnectionResetError,
+            EOFError, IndexError, OSError) as e:
+        # [FIX CRASH] Sauvegarde d'URGENCE avant de mourir. Le serveur
+        # Manager sous Windows peut mourir sous la charge IPC : tous les
+        # proxies deviennent invalides en cascade. Sans ce bloc, perte
+        # totale du run si le crash arrive avant save_every.
+        print(f"\n[train_rl] !!! CRASH a step={step} : "
+              f"{type(e).__name__}: {e}", flush=True)
+        print(f"[train_rl] Sauvegarde d'URGENCE des poids...", flush=True)
+        try:
             os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
-            base = args.output[:-3] if args.output.endswith('.pt') else args.output
-            step_path = f"{base}_step{step:07d}.pt"
-            latest_path = f"{base}_latest.pt"
-            agent.save(step_path)
-            agent.save(latest_path)
-            if args.keep_last_n > 0:
-                _purge_old_checkpoints(base, args.keep_last_n)
-            print(f"[step {step}] save {step_path} + {latest_path}",
+            emergency_path = f"{base_out}_crash_step{step:07d}.pt"
+            agent.save(emergency_path, step=step)
+            print(f"[train_rl] Poids sauvegardes : {emergency_path}",
                   flush=True)
+            print(f"[train_rl] Pour reprendre :", flush=True)
+            print(f"[train_rl]   --resume {emergency_path} "
+                  f"--alpha-resume {alpha:.4f}", flush=True)
+        except Exception as e2:
+            print(f"[train_rl] ECHEC sauvegarde d'urgence : {e2}", flush=True)
+            print(f"[train_rl] Dernier checkpoint valide : cherchez "
+                  f"{base_out}_step*.pt ou {base_out}_latest.pt", flush=True)
+        raise
 
-
+    # --- Fin normale ---
     agent.save(args.output, step=step)
     print(f"[train_rl] termine. Checkpoint : {args.output}", flush=True)
+
+    # [NIVEAU 2] Fermeture propre de la Queue : close + join_thread
+    # garantit que les transitions en transit sont consommees par le
+    # drain thread avant l'extinction.
+    try:
+        transitions_queue.close()
+        transitions_queue.join_thread()
+    except Exception:
+        pass
+
     for w in workers:
         w.terminate()
     for w in workers:
@@ -555,6 +682,13 @@ def main():
     p.add_argument('--h-target', type=float, default=2.0)
     p.add_argument('--alpha-init', type=float, default=0.01)
     p.add_argument('--beta', type=float, default=0.005)
+    p.add_argument('--alpha-max', type=float, default=0.15,
+                   help='[FIX ALPHA] cap sur le coefficient d entropie. '
+                        'Sans lui, alpha monte sans fin quand H_target est '
+                        'inatteignable (policy discard competente plafonne '
+                        'a H~1.7) : le bonus d entropie finit par dominer '
+                        'la policy loss. 0 = pas de cap (comportement '
+                        'papier, deconseille a petite echelle).')
 
     p.add_argument('--oracle-frac', type=float, default=0.20)
     p.add_argument('--transition-frac', type=float, default=0.50)
@@ -571,11 +705,11 @@ def main():
     p.add_argument('--resume', type=str, default=None,
                    help='chemin vers un checkpoint _latest.pt pour reprendre')
     p.add_argument('--ppo-epochs', type=int, default=3,
-                   help='nombre d\'epochs PPO par batch (defaut 3)')
+                   help='nombre d epochs PPO par batch (defaut 3)')
 
     p.add_argument('--alpha-resume', type=float, default=None,
                    help='valeur de alpha au resume (defaut: args.alpha_init)')
-    
+
     args = p.parse_args()
     train(args)
 
