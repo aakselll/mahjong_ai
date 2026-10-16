@@ -6,11 +6,11 @@ Evaluation stable rank Tenhou (Suphx Appendix C), version parallele.
 Utilise GameEnv (4 rounds East) et N workers pour parallelliser.
 
 Usage :
-    py -3.14 -m mahjong_ai.training.eval_stable_rank ^
-        --agent-checkpoint checkpoints/rl_east4_v1.pt ^
-        --sl-discard checkpoints/sl_2015_run1/discard.pt ^
-        --sl-frozen checkpoints/sl_2015_run1 ^
-        --weak-dir checkpoints_old/sl_2015_run1 ^
+    py -3.14 -m mahjong_ai.training.eval_stable_rank `
+        --agent-checkpoint checkpoints/rl_east4_v1.pt `
+        --sl-discard checkpoints/sl_2015_run1/discard.pt `
+        --sl-frozen checkpoints/sl_2015_run1 `
+        --weak-dir checkpoints_old/sl_2015_run1 `
         --n-games 500 --n-workers 5
 """
 import argparse

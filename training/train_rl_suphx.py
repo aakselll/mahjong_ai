@@ -38,14 +38,14 @@ Boucle principale d'entrainement RL Suphx.
     rangs, longueur des parties, distribution des fins de manche.
 
 Usage :
-    py -3.14 -m mahjong_ai.training.train_rl_suphx ^
-        --sl-discard checkpoints/sl_tonpusen_light/discard.pt ^
-        --sl-frozen checkpoints/sl_tonpusen_light ^
-        --grp-checkpoint checkpoints/grp_tonpusen.pt ^
-        --total-steps 500000 --n-workers 4 ^
-        --h-target 1.6 --alpha-max 0.15 --value-coef 0.0 ^
-        --oracle-frac 0.10 --transition-frac 0.30 ^
-        --save-every 25000 --keep-last-n 3 --publish-every 5000 ^
+    py -3.14 -m mahjong_ai.training.train_rl_suphx `
+        --sl-discard checkpoints/sl_tonpusen_light/discard.pt `
+        --sl-frozen checkpoints/sl_tonpusen_light `
+        --grp-checkpoint checkpoints/grp_tonpusen.pt `
+        --total-steps 500000 --n-workers 4 `
+        --h-target 1.6 --alpha-max 0.15 --value-coef 0.0 `
+        --oracle-frac 0.10 --transition-frac 0.30 `
+        --save-every 25000 --keep-last-n 3 --publish-every 5000 `
         --output checkpoints/rl_tonpusen_v2/rl_discard.pt
 """
 import argparse
