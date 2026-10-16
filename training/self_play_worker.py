@@ -200,6 +200,11 @@ def _play_one_game(env, agent, gamma_t):
         result = env.step(action)
 
         if action is not None:
+            # Un siege peut ne recevoir aucune requete DISCARD dans une
+            # manche terminee immediatement. Conserver son reward jusqu'a
+            # sa prochaine transition plutot que le perdre.
+            carried_reward = pending_reward[seat]
+            pending_reward[seat] = 0.0
             transitions.append({
                 'seat': seat,
                 'obs_normal': obs_n,
@@ -208,7 +213,7 @@ def _play_one_game(env, agent, gamma_t):
                 'action': action,
                 'logp': logp,
                 'value': value,
-                'reward': 0.0,          # [FIX] rempli a la fin de la manche
+                'reward': carried_reward,
                 'done': False,
             })
             # [FIX] Enregistrer TOUTES les transitions du siege
