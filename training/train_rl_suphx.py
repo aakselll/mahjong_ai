@@ -670,6 +670,19 @@ def train(args):
                 for a in alerts:
                     print(f"    | !! {a}", flush=True)
 
+                # [FAIL-FAST] Une tete SL figee en erreur (ou une requete
+                # non-DISCARD inattendue) fausse toutes les parties : plus de
+                # riichi/pon/chow corrects. S'entrainer dessus est du temps
+                # perdu -> on s'arrete (sauf --allow-sl-errors).
+                n_err = stats_proxy.get('n_sl_errors', 0)
+                n_unh = stats_proxy.get('n_unhandled', 0)
+                if (n_err or n_unh) and not args.allow_sl_errors:
+                    raise RuntimeError(
+                        f"tetes SL figees en erreur (n_sl_errors={n_err}, "
+                        f"n_unhandled={n_unh}) : parties invalides. "
+                        f"Voir le traceback [env] plus haut. "
+                        f"--allow-sl-errors pour ignorer.")
+
             if step % args.save_every < len(batch):
                 os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
                 step_path = f"{base_out}_step{step:07d}.pt"
@@ -748,6 +761,9 @@ def main():
                    help="entropie cible (Eq. 3) : un nombre, ou 'auto' = "
                         "entropie mesuree de la policy au demarrage "
                         "(voir --h-calib-updates / --h-target-mult)")
+    p.add_argument('--allow-sl-errors', action='store_true',
+                   help="ne pas s'arreter si une tete SL figee echoue "
+                        "(deconseille : parties invalides)")
     p.add_argument('--h-calib-updates', type=int, default=5,
                    help="nb d'updates moyennes pour --h-target auto")
     p.add_argument('--h-target-mult', type=float, default=1.0,

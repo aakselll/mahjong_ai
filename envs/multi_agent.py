@@ -105,6 +105,9 @@ class MultiAgentMahjongEnv:
         self.ura_dora_indicators = None
         self.riichi = None
         self.riichi_deposits = 0
+        # [FIX BATONS RIICHI] cout de baton deja paye CETTE manche, par
+        # siege interne (unite reward, positif = paye). Applique dans _final.
+        self.stick_paid = [0.0, 0.0, 0.0, 0.0]
         self._furiten_temp = [False, False, False, False]
         self._abortive_riichi_count = 0
         self._abortive_kan_count = 0
@@ -150,11 +153,16 @@ class MultiAgentMahjongEnv:
                 self._stats["yaku_counts"][y.name] = \
                     self._stats["yaku_counts"].get(y.name, 0) + 1
 
-    def set_game_context(self, round_wind_idx, round_idx, scores, honba=0):
+    def set_game_context(self, round_wind_idx, round_idx, scores, honba=0,
+                         kyoutaku=0):
+        # kyoutaku : batons de riichi restes sur la table (manche nulle
+        # precedente) ; ils sont deja payes, reportes ici et empoches par
+        # le prochain gagnant.
         self.ctx = {"round_wind_idx": int(round_wind_idx),
                     "round_idx": int(round_idx),
                     "scores": [float(x) for x in scores],
-                    "honba": int(honba)}
+                    "honba": int(honba),
+                    "kyoutaku": int(kyoutaku)}
 
     def reset_round(self):
         while True:
@@ -200,7 +208,9 @@ class MultiAgentMahjongEnv:
         self.melds = [[] for _ in range(4)]
         self.discards = [np.zeros(N_TILES, dtype=np.int32) for _ in range(4)]
         self.riichi = [False, False, False, False]
-        self.riichi_deposits = 0
+        # [FIX BATONS RIICHI] on repart des batons reportes (0 par defaut).
+        self.riichi_deposits = int(self.ctx.get("kyoutaku", 0))
+        self.stick_paid = [0.0, 0.0, 0.0, 0.0]
         self._furiten_temp = [False, False, False, False]
         self._abortive_riichi_count = 0
         self._abortive_kan_count = 0
@@ -466,11 +476,12 @@ class MultiAgentMahjongEnv:
         return None
 
     def _abortive_draw_rewards(self, exclude=None):
-        r = self._zero_rewards()
-        for s in range(4):
-            if self.riichi[s] and s != exclude:
-                r[s] += RIICHI_STICK_NET_COST * REWARD_SCALE
-        return r
+        # [FIX BATONS RIICHI] Avant : +1.0 de "remboursement" a chaque
+        # riichi, pour un baton jamais debite -> argent cree de rien. Les
+        # regles reelles ne remboursent pas : les batons restent sur la
+        # table (reportes a la manche suivante). Le cout est deja dans
+        # stick_paid, applique par _final. `exclude` garde pour compat.
+        return self._zero_rewards()
 
     def _chow_variants(self, seat, tile):
         if not self._is_suited(tile):
@@ -647,10 +658,17 @@ class MultiAgentMahjongEnv:
         try:
             import torch
             obs = self._build_obs(seat, pending_claim_tile=pending_claim_tile)
-            obs_t = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
             model = self.frozen_sl[head]
+            # [FIX DEVICE] Les tetes gelees vivent sur le device du worker
+            # (cuda:0 en entrainement GPU) ; l'obs etait creee sur CPU ->
+            # "Expected all tensors to be on the same device". L'ancien
+            # `except Exception: return None` avalait l'erreur : AUCUNE tete
+            # SL (riichi/pon/chow/kong) ne fonctionnait en entrainement GPU.
+            dev = next(model.parameters()).device
+            obs_t = torch.as_tensor(obs, dtype=torch.float32,
+                                    device=dev).unsqueeze(0)
             with torch.no_grad():
-                logits = model(obs_t)[0].numpy()
+                logits = model(obs_t)[0].cpu().numpy()
             # [FIX MASQUE] logits * mask ne masque pas : une action illegale
             # vaut 0 et gagne l'argmax des que tous les logits legaux sont
             # negatifs (ex. chow : variante illegale choisie -> main
@@ -723,10 +741,18 @@ class MultiAgentMahjongEnv:
                 "round_done": False, "final_rewards": None,
                 "next_request": next_request}
 
-    @staticmethod
-    def _final(imm_reward, acting_seat, final_rewards, outcome):
+    def _final(self, imm_reward, acting_seat, final_rewards, outcome):
         if acting_seat is not None:
             final_rewards[acting_seat] = final_rewards.get(acting_seat, 0.0) + imm_reward
+        # [FIX BATONS RIICHI] Le cout du baton (-1000 a la declaration) etait
+        # range dans `pending`, ecrase des le discard suivant, donc jamais
+        # preleve : un riichi etait GRATUIT et les batons empoches par le
+        # gagnant n'avaient jamais ete payes (somme des scores non nulle).
+        # Preleve ici, pour TOUTES les issues de manche (tsumo, ron, chankan,
+        # exhaustive, abortives), independamment de `pending`.
+        for s in range(4):
+            if self.stick_paid[s]:
+                final_rewards[s] = final_rewards.get(s, 0.0) - self.stick_paid[s]
         return {"imm_reward": None, "acting_seat": None,
                 "round_done": True, "final_rewards": final_rewards,
                 "next_request": None, "outcome": outcome}
@@ -911,12 +937,15 @@ class MultiAgentMahjongEnv:
                         self._ippatsu[seat] = True
                         self.riichi[seat] = True
                         self.riichi_deposits += 1
+                        # [FIX BATONS RIICHI] cout enregistre ici, preleve
+                        # en fin de manche par _final (et non plus dans
+                        # `pending`, ecrase au discard suivant).
+                        self.stick_paid[seat] += RIICHI_STICK_NET_COST * REWARD_SCALE
                         self._abortive_riichi_count += 1
                         forced_discard_mask = np.zeros(N_TILES, dtype=np.float32)
                         for t in riichi_options:
                             forced_discard_mask[t] = 1.0
-                        pending = (-RIICHI_STICK_NET_COST * REWARD_SCALE
-                                    + RIICHI_DECLARE_BONUS, seat)
+                        pending = (RIICHI_DECLARE_BONUS, seat)
                         abort = self._check_abortive_draw()
                         if abort:
                             self._stats[abort] += 1
