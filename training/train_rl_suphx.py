@@ -77,6 +77,10 @@ STATS_KEYS_INIT = {
     'n_tsumo': 0, 'n_ron': 0, 'n_exhaustive': 0,
     'n_abortive': 0,
     'n_riichi': 0,
+    'n_pon': 0, 'n_chi': 0, 'n_kan': 0,
+    'n_ron_refused': 0,
+    'n_sl_errors': 0,       # doit rester 0 (tete SL figee en erreur)
+    'n_unhandled': 0,       # doit rester 0 (requete non-DISCARD inattendue)
 }
 
 
@@ -109,9 +113,20 @@ def format_game_stats(stats_proxy):
     exh_pct = 100 * n_exh / max(total_ends, 1)
     ab_pct = 100 * n_ab / max(total_ends, 1)
 
-    return (
+    # [STATS] Taux par manche (4 joueurs confondus). n_rounds_total compte
+    # les manches de toutes les parties.
+    n_rounds_total = max(stats_proxy.get('n_rounds_total', 0), 1)
+    riichi_rnd = stats_proxy.get('n_riichi', 0) / n_rounds_total
+    calls_rnd = (stats_proxy.get('n_pon', 0) + stats_proxy.get('n_chi', 0)
+                 + stats_proxy.get('n_kan', 0)) / n_rounds_total
+    refused_rnd = stats_proxy.get('n_ron_refused', 0) / n_rounds_total
+
+    line = (
         f"n={n_games} "
         f"[{n1}/{n2}/{n3}/{n4}] "
+        # NB : wr/mean_rank concernent le siege 0 ; les 4 sieges partagent
+        # la meme policy -> esperance 0.25 / 2.50 par symetrie. Ce n'est
+        # PAS une mesure de progres (utiliser eval_stable_rank vs SL).
         f"wr={win_rate:.3f} "
         f"mean_rank={mean_rank:.2f} "
         f"rounds={mean_rounds:.2f} "
@@ -119,8 +134,16 @@ def format_game_stats(stats_proxy):
         f"tsumo%={tsumo_pct:.0f} "
         f"ron%={ron_pct:.0f} "
         f"exh%={exh_pct:.0f} "
-        f"ab%={ab_pct:.0f}"
+        f"ab%={ab_pct:.0f} "
+        f"riichi/rnd={riichi_rnd:.2f} "
+        f"calls/rnd={calls_rnd:.2f} "
+        f"ron_refus/rnd={refused_rnd:.2f}"
     )
+    n_err = stats_proxy.get('n_sl_errors', 0)
+    n_unh = stats_proxy.get('n_unhandled', 0)
+    if n_err or n_unh:
+        line += f" !!SL_ERR={n_err} !!UNHANDLED={n_unh}"
+    return line
 
 
 def _purge_old_checkpoints(base_path, keep_n):
@@ -268,6 +291,10 @@ def pg_is_loss(agent, transitions, advantages, gamma_t,
     new_logp, values, entropy = agent.evaluate_actions(
         obs_n, obs_o, masks, actions, gamma_t)
     ratio = torch.exp(new_logp - old_logp)
+    # [DIAG] ecart moyen du ratio a 1 (lu par la boucle a l'epoch 0).
+    # NB : non nul meme sans bug, car le buffer est un replay et les
+    # workers jouent avec des poids publies tous les --publish-every steps.
+    agent.last_ratio_dev = float((ratio.detach() - 1.0).abs().mean().item())
 
     if phase == 3 and iw_threshold is not None:
         keep = (ratio <= iw_threshold).float()
@@ -312,6 +339,15 @@ def train(args):
     print(f"[train_rl] alpha : init={args.alpha_init}, max={args.alpha_max}, "
           f"h_target={args.h_target}, beta={args.beta}",
           flush=True)
+
+    # [H-TARGET AUTO] --h-target auto : la cible est l'entropie MESUREE de
+    # la policy au demarrage (moyenne des --h-calib-updates premiers
+    # updates, avant tout pas de gradient significatif), x --h-target-mult.
+    # Evite une cible inatteignable qui pousse alpha au cap en permanence
+    # (cf. logs : H 1.03 -> 1.65 avec h_target=1.6 et alpha colle a 0.15).
+    h_auto = str(args.h_target).strip().lower() == 'auto'
+    h_target = None if h_auto else float(args.h_target)
+    h_calib = []
 
     # --- Parameter server (etat LEGER : poids, alpha, gamma) + Queue ---
     ps = ParameterServer()
@@ -394,6 +430,17 @@ def train(args):
                   flush=True)
         except Exception as e:
             print(f"[train_rl] ECHEC resume : {e}", flush=True)
+
+    # [FIX BATCHNORM] Policy en eval : stats BN du SL figees, identiques
+    # entre rollout (batch 1) et update (batch ~1000).
+    agent.set_eval_mode()
+    print(f"[train_rl] policy.training={agent.policy.training} "
+          f"(doit etre False)", flush=True)
+    if args.resume:
+        print("[train_rl] ATTENTION : un checkpoint RL produit AVANT ce fix "
+              "contient des running stats BN polluees par le mode train. "
+              "Repartir du SL (sans --resume) pour un test propre.",
+              flush=True)
 
     # --- Publish initial ---
     publish_to_state(
@@ -504,6 +551,8 @@ def train(args):
             policy_gnorm_last = None
             critic_gnorm_last = None
 
+            entropy_first = None
+            ratio_dev_first = None
             for epoch_i in range(PPO_EPOCHS):
                 agent.policy_optim.zero_grad()
                 agent.critic_optim.zero_grad()
@@ -513,6 +562,9 @@ def train(args):
                     clip_eps=args.clip_eps, iw_threshold=iw_thresh, phase=phase)
                 if policy_loss is None:
                     break
+                if epoch_i == 0:
+                    entropy_first = entropy.item()
+                    ratio_dev_first = getattr(agent, 'last_ratio_dev', None)
                 loss = policy_loss + args.value_coef * value_loss - alpha * entropy
                 loss.backward()
                 policy_gnorm_last = torch.nn.utils.clip_grad_norm_(
@@ -527,6 +579,16 @@ def train(args):
 
             if policy_loss_last is None:
                 continue
+
+            # [H-TARGET AUTO] calibration sur l'entropie de depart
+            if h_target is None and entropy_first is not None:
+                h_calib.append(entropy_first)
+                if len(h_calib) >= args.h_calib_updates:
+                    h_target = float(np.mean(h_calib)) * args.h_target_mult
+                    print(f"[train_rl] h_target auto = {h_target:.4f} "
+                          f"(moyenne de {len(h_calib)} updates x "
+                          f"{args.h_target_mult})", flush=True)
+
             policy_loss = policy_loss_last
             value_loss = value_loss_last
             entropy = entropy_last
@@ -542,14 +604,14 @@ def train(args):
             recent_entropies.append(entropy.item())
             if len(recent_entropies) > 50:
                 recent_entropies.pop(0)
-            if len(recent_entropies) >= 3:
+            if len(recent_entropies) >= 3 and h_target is not None:
                 h_bar = np.mean(recent_entropies)
                 # [FIX ALPHA] Cap : sans lui, alpha monte sans fin quand
                 # H_target est inatteignable (policy discard competente
                 # plafonne a H~1.7). Run 600k precedent : alpha=0.41 final,
                 # bonus d'entropie ~7x la policy loss -> policy aplatie ->
                 # 34 pourcent de 4es places contre 25 attendu.
-                raw_update = alpha + args.beta * (args.h_target - h_bar)
+                raw_update = alpha + args.beta * (h_target - h_bar)
                 if args.alpha_max > 0:
                     alpha = max(0.0, min(raw_update, args.alpha_max))
                 else:
@@ -571,12 +633,15 @@ def train(args):
                 elapsed = time.time() - t_start
                 metrics = compute_drift_metrics(batch)
                 alerts = check_drift_alerts(metrics, phase)
+                rdev_str = (f"{ratio_dev_first:.3f}"
+                            if ratio_dev_first is not None else "n/a")
 
                 print(f"[step {step:7d} | phase {phase}] "
                       f"pl={policy_loss.item():+.4f} "
                       f"vl={value_loss.item():.4f} "
                       f"H={entropy.item():.4f} "
                       f"alpha={alpha:.4f} "
+                      f"rdev={rdev_str} "
                       f"gamma={gamma_t:.3f} "
                       f"buf={current_buf} "
                       f"({elapsed:.0f}s)", flush=True)
@@ -679,7 +744,14 @@ def main():
     p.add_argument('--lam', type=float, default=0.95)
     p.add_argument('--clip-eps', type=float, default=0.2)
     p.add_argument('--value-coef', type=float, default=0.5)
-    p.add_argument('--h-target', type=float, default=2.0)
+    p.add_argument('--h-target', type=str, default='2.0',
+                   help="entropie cible (Eq. 3) : un nombre, ou 'auto' = "
+                        "entropie mesuree de la policy au demarrage "
+                        "(voir --h-calib-updates / --h-target-mult)")
+    p.add_argument('--h-calib-updates', type=int, default=5,
+                   help="nb d'updates moyennes pour --h-target auto")
+    p.add_argument('--h-target-mult', type=float, default=1.0,
+                   help="facteur applique a la cible auto (ex. 1.1)")
     p.add_argument('--alpha-init', type=float, default=0.01)
     p.add_argument('--beta', type=float, default=0.005)
     p.add_argument('--alpha-max', type=float, default=0.15,

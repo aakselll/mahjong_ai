@@ -130,6 +130,7 @@ class MultiAgentMahjongEnv:
             "forced_closed_seat_hands": 0, "seat_hands": 0,
             "pon_calls": 0, "chi_calls": 0, "open_calls": 0,
             "wins_open": 0, "wins_closed": 0, "no_yaku_calls": 0,
+            "sl_errors": 0,
         }
 
     def get_stats(self):
@@ -650,12 +651,30 @@ class MultiAgentMahjongEnv:
             model = self.frozen_sl[head]
             with torch.no_grad():
                 logits = model(obs_t)[0].numpy()
-            masked = logits * mask
-            if masked.sum() == 0:
-                return None
+            # [FIX MASQUE] logits * mask ne masque pas : une action illegale
+            # vaut 0 et gagne l'argmax des que tous les logits legaux sont
+            # negatifs (ex. chow : variante illegale choisie -> main
+            # corrompue). On masque a -inf.
+            legal = np.asarray(mask) > 0
+            if not legal.any():
+                return 0
+            masked = np.where(legal, logits, -np.inf)
             return int(masked.argmax())
         except Exception:
-            return None
+            # [FIX ECHEC SILENCIEUX] Avant : return None -> l'env yield une
+            # requete que le worker renvoyait avec action=None, et pour CHOW
+            # None != CHOW_PASS appliquait un chow illegal. Maintenant :
+            # compteur (visible dans la ligne GAME), traceback une seule
+            # fois, et action SURE (0 = passer / non).
+            import traceback
+            self._stats["sl_errors"] = self._stats.get("sl_errors", 0) + 1
+            if not getattr(self, "_sl_error_logged", False):
+                self._sl_error_logged = True
+                print(f"[env] !!! erreur tete SL figee '{head}' "
+                      f"(action sure 0 utilisee ; compteur n_sl_errors) :",
+                      flush=True)
+                traceback.print_exc()
+            return 0
         
     @staticmethod
     def _zero_rewards():

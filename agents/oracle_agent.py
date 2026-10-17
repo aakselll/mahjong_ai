@@ -95,6 +95,24 @@ class OracleDiscardAgent:
         self.critic_optim = torch.optim.Adam(self.critic.parameters(),
                                              lr=critic_lr)
 
+        # [FIX BATCHNORM] La policy contient des BatchNorm2d (tronc + 16
+        # blocs). Un module fraichement construit est en mode train : en
+        # rollout (select_action, batch de 1) la BN normaliserait alors
+        # chaque canal sur les seuls 34 emplacements de l'etat courant au
+        # lieu d'utiliser les stats du SL, et evaluate_actions (batch de
+        # ~1000) utiliserait d'autres stats encore -> la policy qui joue
+        # n'est pas celle du checkpoint SL et le ratio PPO est du bruit.
+        # En eval, les stats SL sont figees (les gradients, eux, passent
+        # normalement, et gamma/beta de la BN restent entrainables).
+        self.policy.eval()
+
+    def set_eval_mode(self):
+        """Remet la policy en eval (BN figee). A rappeler apres tout
+        load_state_dict / resume : load_state_dict ne change pas le mode,
+        mais un .train() externe l'aurait change."""
+        self.policy.eval()
+        self.critic.eval()
+
     def _load_partial_sl(self, state_dict):
         """Charge partiellement : le trunk (conv_in) attend 386 canaux mais
         le SL en a 250. On étend les poids d'entrée en initialisant les
