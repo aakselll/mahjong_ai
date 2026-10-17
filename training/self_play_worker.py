@@ -111,12 +111,24 @@ def worker_loop(worker_id, state, lock, transitions_queue,
                 # [NIVEAU 2] put au lieu de buffer_add.
                 # timeout : ne pas bloquer indefiniment si le trainer est
                 # mort (Queue pleine -> exception -> arret propre).
-                try:
-                    transitions_queue.put(transitions, timeout=30.0)
-                except Exception:
+                # [FIX MEMOIRE] La Queue est volontairement PETITE
+                # (backpressure) : une file momentanement pleine est normale
+                # quand le trainer est occupe. On reessaie (6 x 30 s) avant
+                # de conclure que le trainer est mort.
+                put_ok = False
+                for _attempt in range(6):
+                    try:
+                        transitions_queue.put(transitions, timeout=30.0)
+                        put_ok = True
+                        break
+                    except Exception:
+                        print(f"[worker {worker_id}] Queue pleine/indisponible "
+                              f"(essai {_attempt + 1}/6)", flush=True)
+                if not put_ok:
                     print(f"[worker {worker_id}] Queue indisponible -- "
                           f"arret du worker", flush=True)
                     return
+                transitions = None      # libere la partie des que envoyee
             # [STATS] mise a jour du proxy partage
             if game_stats is not None:
                 _update_stats(stats_proxy, lock, game_stats)
@@ -229,7 +241,11 @@ def _play_one_game(env, agent, gamma_t):
             pending_reward[seat] = 0.0
             transitions.append({
                 'seat': seat,
-                'obs_normal': obs_n,
+                # [FIX MEMOIRE] float16 : ~18 Ko au lieu de ~36 Ko par coup.
+                # Les canaux sont binaires (hands >= n) ou multiples de 1/4
+                # (unseen/4) : exacts en float16. pg_is_loss reconvertit en
+                # float32 (torch.as_tensor(..., dtype=float32)).
+                'obs_normal': np.asarray(obs_n, dtype=np.float16),
                 'obs_oracle': masked_obs_o,
                 'mask': mask,
                 'action': action,
