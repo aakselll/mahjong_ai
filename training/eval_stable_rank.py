@@ -292,6 +292,8 @@ def evaluate(args):
         print(f"  !! {total} parties : trop peu pour conclure "
               f"(viser >= 1000, IC ci-dessus).")
     print(f"  Duree     : {elapsed:.1f}s ({total/elapsed:.2f} games/s)")
+    return {'n': (n1, n2, n3, n4), 'mean_rank': mr, 'mean_rank_ci': mr_ci,
+            'stable_rank': sr, 'sr_ci': (sr_lo, sr_hi)}
 
 
 def main():

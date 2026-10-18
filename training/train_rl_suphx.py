@@ -540,6 +540,12 @@ def train(args):
     current_phase, _, _ = get_phase_and_gamma(
         step, args.total_steps, args.oracle_frac, args.transition_frac)
     base_lr = args.lr
+    agent.compute_kl = args.kl_coef > 0
+    print(f"[train_rl] ancre KL vers le SL : coef={args.kl_coef} "
+          f"({'ON' if agent.compute_kl else 'OFF'}) ; checkpoints jalons "
+          f"tous les {args.milestone_every} steps", flush=True)
+    last_milestone = start_step // args.milestone_every \
+        if args.milestone_every > 0 else 0
     # [FIX LR-RESUME] Les facteurs de LR n'etaient appliques qu'au CHANGEMENT
     # de phase : un resume directement en phase 2/3 gardait le LR plein.
     # L'optimizer n'est pas sauvegarde -> on applique le facteur ici.
@@ -649,6 +655,7 @@ def train(args):
 
             entropy_first = None
             ratio_dev_first = None
+            kl_last = None
             for epoch_i in range(PPO_EPOCHS):
                 agent.policy_optim.zero_grad()
                 agent.critic_optim.zero_grad()
@@ -662,6 +669,10 @@ def train(args):
                     entropy_first = entropy.item()
                     ratio_dev_first = getattr(agent, 'last_ratio_dev', None)
                 loss = policy_loss + args.value_coef * value_loss - alpha * entropy
+                kl_t = getattr(agent, 'last_kl', None)
+                if args.kl_coef > 0 and kl_t is not None:
+                    loss = loss + args.kl_coef * kl_t
+                    kl_last = float(kl_t.detach().item())
                 loss.backward()
                 policy_gnorm_last = torch.nn.utils.clip_grad_norm_(
                     agent.policy.parameters(), 5.0)
@@ -744,6 +755,7 @@ def train(args):
                 alerts = check_drift_alerts(metrics, phase)
                 rdev_str = (f"{ratio_dev_first:.3f}"
                             if ratio_dev_first is not None else "n/a")
+                kl_str = f"{kl_last:.4f}" if kl_last is not None else "off"
 
                 print(f"[step {step:7d} | phase {phase}] "
                       f"pl={policy_loss.item():+.4f} "
@@ -751,6 +763,7 @@ def train(args):
                       f"H={entropy.item():.4f} "
                       f"alpha={alpha:.4f} "
                       f"rdev={rdev_str} "
+                      f"kl={kl_str} "
                       f"gamma={gamma_t:.3f} "
                       f"buf={current_buf}{mem_info} "
                       f"({elapsed:.0f}s)", flush=True)
@@ -802,6 +815,15 @@ def train(args):
                 agent.save(latest_path, step=step, alpha=alpha)
                 if args.keep_last_n > 0:
                     _purge_old_checkpoints(base_out, args.keep_last_n)
+                # [JALONS] checkpoints JAMAIS purges, pour evaluer plus tard
+                # (eval_checkpoints.py) et reprendre le meilleur : le dernier
+                # n'est pas forcement le meilleur.
+                if (args.milestone_every > 0
+                        and step // args.milestone_every > last_milestone):
+                    last_milestone = step // args.milestone_every
+                    ms_path = f"{base_out}_milestone{step:09d}.pt"
+                    agent.save(ms_path, step=step, alpha=alpha)
+                    print(f"[step {step}] jalon {ms_path}", flush=True)
                 print(f"[step {step}] save {step_path} + {latest_path}",
                       flush=True)
 
@@ -913,6 +935,13 @@ def main():
 
     p.add_argument('--iw-threshold', type=float, default=5.0)
     p.add_argument('--keep-last-n', type=int, default=0)
+    p.add_argument('--kl-coef', type=float, default=0.05,
+                   help='[ANCRE] poids de KL(pi || pi_SL) dans la loss. '
+                        '0 = desactive. Plage utile 0.02-0.2 : trop bas -> '
+                        'derive passive ; trop haut -> reste colle au SL.')
+    p.add_argument('--milestone-every', type=int, default=1000000,
+                   help='un checkpoint *_milestoneN.pt jamais purge tous '
+                        'les N steps (0 = desactive)')
 
     p.add_argument('--publish-every', type=int, default=2000)
     p.add_argument('--save-every', type=int, default=50000)

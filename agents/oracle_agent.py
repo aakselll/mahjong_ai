@@ -9,6 +9,7 @@ Conforme au papier §3.3 (oracle guiding) :
 Une fois γ=0, l'agent devient "normal" (250 canaux effectifs, les 136
 autres à zéro). C'est ce qui permet de déployer l'agent sans info parfaite.
 """
+import copy
 import numpy as np
 import torch
 import torch.nn as nn
@@ -60,6 +61,18 @@ class OracleDiscardAgent:
         print(f"[oracle_agent] discard SL charge "
               f"(val_acc={ck.get('val_acc','?')}, "
               f"arch={channels}x{n_blocks})", flush=True)
+
+        # [ANCRE KL] Copie GELEE de la policy SL de depart. Sert de
+        # reference pour la penalite KL(pi || pi_SL) : sans ancrage le
+        # self-play symetrique derive vers des politiques passives (run
+        # 15M : 38 pourcent d'exhaustive draws, rang moyen 2.68 vs 2.50
+        # pour le SL). Construite ICI (depuis le SL), donc inchangee par un
+        # --resume qui ne charge que les poids de self.policy.
+        self.ref_policy = copy.deepcopy(self.policy).eval()
+        for _p in self.ref_policy.parameters():
+            _p.requires_grad = False
+        self.compute_kl = False       # active par la boucle (--kl-coef > 0)
+        self.last_kl = None
 
         # --- Critic ---
         self.critic = Critic().to(device)
@@ -232,7 +245,19 @@ class OracleDiscardAgent:
         log_probs = torch.log_softmax(masked_logits, dim=-1)
         probs = torch.exp(log_probs)
         entropy = -(probs * log_probs).sum(dim=-1)
-        
+
+        # [ANCRE KL] KL(pi || pi_SL) moyenne sur les etats du batch, avec
+        # gradient vers pi. Stockee dans self.last_kl (la signature de
+        # retour est inchangee). Memes etats et memes masques que pi.
+        if self.compute_kl:
+            with torch.no_grad():
+                ref_logits = self.ref_policy(x) + (mask_t - 1.0) * 1e9
+                ref_log_probs = torch.log_softmax(ref_logits, dim=-1)
+            self.last_kl = (probs * (log_probs - ref_log_probs)
+                            ).sum(dim=-1).mean()
+        else:
+            self.last_kl = None
+
         return logp, values.squeeze(-1), entropy
 
     # ------------------------------------------------------------------ #
