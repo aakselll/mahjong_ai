@@ -464,7 +464,20 @@ def train(args):
             agent.policy.load_state_dict(ck['policy'])
             agent.critic.load_state_dict(ck['critic'])
             start_step = ck.get('step', 0) or 0
-            start_alpha = ck.get('alpha', args.alpha_init) or args.alpha_init
+            # [FIX ALPHA-RESUME] priorite : --alpha-resume explicite >
+            # alpha du checkpoint > --alpha-init.
+            if args.alpha_resume is not None:
+                start_alpha = args.alpha_resume
+                print(f"[train_rl]   alpha : --alpha-resume "
+                      f"({start_alpha:.4f}) prioritaire", flush=True)
+            elif ck.get('alpha') is not None:
+                start_alpha = float(ck['alpha'])
+                print(f"[train_rl]   alpha : repris du checkpoint "
+                      f"({start_alpha:.4f})", flush=True)
+            else:
+                print(f"[train_rl]   alpha : absent du checkpoint (ancien "
+                      f"format) -> {start_alpha:.4f} ; utiliser "
+                      f"--alpha-resume pour le fixer", flush=True)
 
             # Extraction depuis le nom si step=0 (anciens checkpoints)
             if start_step == 0:
@@ -527,6 +540,20 @@ def train(args):
     current_phase, _, _ = get_phase_and_gamma(
         step, args.total_steps, args.oracle_frac, args.transition_frac)
     base_lr = args.lr
+    # [FIX LR-RESUME] Les facteurs de LR n'etaient appliques qu'au CHANGEMENT
+    # de phase : un resume directement en phase 2/3 gardait le LR plein.
+    # L'optimizer n'est pas sauvegarde -> on applique le facteur ici.
+    if current_phase != 1:
+        _, _, _lrf = get_phase_and_gamma(
+            step, args.total_steps, args.oracle_frac, args.transition_frac)
+        _cf = {1: 1.0, 2: 0.5, 3: 0.1}[current_phase]
+        for pg in agent.policy_optim.param_groups:
+            pg['lr'] = base_lr * _lrf
+        for pg in agent.critic_optim.param_groups:
+            pg['lr'] = args.critic_lr * _cf
+        print(f"[train_rl] resume en phase {current_phase} : "
+              f"policy lr={base_lr * _lrf:.2e} (x{_lrf}), "
+              f"critic lr={args.critic_lr * _cf:.2e}", flush=True)
     t_start = time.time()
     n_updates = 0
 
@@ -771,8 +798,8 @@ def train(args):
                 latest_path = f"{base_out}_latest.pt"
                 # [FIX RESUME] step passe au save -> le checkpoint contient
                 # le step reel, plus besoin du regex sur le nom.
-                agent.save(step_path, step=step)
-                agent.save(latest_path, step=step)
+                agent.save(step_path, step=step, alpha=alpha)
+                agent.save(latest_path, step=step, alpha=alpha)
                 if args.keep_last_n > 0:
                     _purge_old_checkpoints(base_out, args.keep_last_n)
                 print(f"[step {step}] save {step_path} + {latest_path}",
@@ -799,12 +826,13 @@ def train(args):
         try:
             os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
             emergency_path = f"{base_out}_crash_step{step:07d}.pt"
-            agent.save(emergency_path, step=step)
+            agent.save(emergency_path, step=step, alpha=alpha)
             print(f"[train_rl] Poids sauvegardes : {emergency_path}",
                   flush=True)
             print(f"[train_rl] Pour reprendre :", flush=True)
             print(f"[train_rl]   --resume {emergency_path} "
-                  f"--alpha-resume {alpha:.4f}", flush=True)
+                  f"(alpha={alpha:.4f} sauvegarde dans le checkpoint)",
+                  flush=True)
         except Exception as e2:
             print(f"[train_rl] ECHEC sauvegarde d'urgence : {e2}", flush=True)
             print(f"[train_rl] Dernier checkpoint valide : cherchez "
@@ -812,7 +840,7 @@ def train(args):
         raise
 
     # --- Fin normale ---
-    agent.save(args.output, step=step)
+    agent.save(args.output, step=step, alpha=alpha)
     print(f"[train_rl] termine. Checkpoint : {args.output}", flush=True)
 
     # [NIVEAU 2] Fermeture propre de la Queue : close + join_thread
@@ -896,7 +924,8 @@ def main():
                    help='nombre d epochs PPO par batch (defaut 3)')
 
     p.add_argument('--alpha-resume', type=float, default=None,
-                   help='valeur de alpha au resume (defaut: args.alpha_init)')
+                   help='alpha au resume ; prioritaire sur le checkpoint '
+                        '(defaut: alpha du checkpoint, sinon --alpha-init)')
 
     args = p.parse_args()
     train(args)
