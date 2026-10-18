@@ -79,7 +79,9 @@ class SLWeakAgent:
         return int(masked.argmax(dim=-1).item())
 
 class RLAgent:
-    def __init__(self, checkpoint, sl_discard, sl_frozen, device='cpu'):
+    def __init__(self, checkpoint, sl_discard, sl_frozen, device='cpu',
+                 sample=False):
+        self.sample = sample
         from mahjong_ai.agents.oracle_agent import OracleDiscardAgent
         self.agent = OracleDiscardAgent(sl_discard, sl_frozen, device=device)
         ck = torch.load(checkpoint, map_location=device, weights_only=False)
@@ -110,6 +112,10 @@ class RLAgent:
         with torch.no_grad():
             logits, _, _ = self.agent.forward_with_dropout(on, oo, gamma_t=0.0)
             masked = logits + (mask_t - 1.0) * 1e9
+            if self.sample:
+                # [EVAL] politique echantillonnee, comme a l'entrainement
+                probs = torch.softmax(masked, dim=-1)
+                return int(torch.multinomial(probs, 1).item())
         return int(masked.argmax(dim=-1).item())
 
 
@@ -117,7 +123,8 @@ class RLAgent:
 # Worker : joue N parties et retourne les compteurs
 # ====================================================================== #
 def eval_worker(worker_id, n_games, agent_checkpoint, sl_discard,
-                 sl_frozen, weak_dir, device='cpu', seed=0):
+                 sl_frozen, weak_dir, device='cpu', seed=0, sample=False,
+                 worker_offset=0):
     """Chaque worker : charge ses propres modeles (thread-safe car process).
 
     Retourne (n1, n2, n3, n4) sur n_games parties.
@@ -131,7 +138,9 @@ def eval_worker(worker_id, n_games, agent_checkpoint, sl_discard,
 
     # Chargement (log pour chaque worker)
     t_load = time.time()
-    rl_agent = RLAgent(agent_checkpoint, sl_discard, sl_frozen, device)
+    torch.manual_seed(seed + worker_id)
+    rl_agent = RLAgent(agent_checkpoint, sl_discard, sl_frozen, device,
+                       sample=sample)
     weak = SLWeakAgent(weak_dir, device)
     print(f"[worker {worker_id}] modeles charges en "
           f"{time.time()-t_load:.1f}s (threads={threads})", flush=True)
@@ -146,7 +155,10 @@ def eval_worker(worker_id, n_games, agent_checkpoint, sl_discard,
     n1 = n2 = n3 = n4 = 0
     t0 = time.time()
     for i in range(n_games):
-        rank = _play_one_game(rl_agent, weak, env, eval_seat=0)
+        # [EVAL] rotation des sieges : le siege 0 est dealer a la 1re manche,
+        # le fixer biaisait la mesure. Chaque siege est evalue autant.
+        eval_seat = (worker_offset + i) % 4
+        rank = _play_one_game(rl_agent, weak, env, eval_seat=eval_seat)
         if rank == 1: n1 += 1
         elif rank == 2: n2 += 1
         elif rank == 3: n3 += 1
@@ -196,6 +208,26 @@ def compute_stable_rank(n1, n2, n4):
     return (5 * n1 + 2 * n2) / n4 - 2
 
 
+def mean_rank_ci(n1, n2, n3, n4):
+    """Rang moyen +- demi-intervalle de confiance a 95 % (loi normale)."""
+    import numpy as np
+    ranks = np.repeat([1, 2, 3, 4], [n1, n2, n3, n4])
+    m = float(ranks.mean())
+    return m, 1.96 * float(ranks.std(ddof=1)) / (len(ranks) ** 0.5)
+
+
+def stable_rank_ci(n1, n2, n3, n4, n_boot=20000, seed=0):
+    """Bootstrap multinomial 95 % : le stable rank est un ratio tres bruite."""
+    import numpy as np
+    rng = np.random.default_rng(seed)
+    tot = n1 + n2 + n3 + n4
+    draws = rng.multinomial(tot, np.array([n1, n2, n3, n4]) / tot,
+                            size=n_boot)
+    vals = np.array([compute_stable_rank(d[0], d[1], d[3]) for d in draws])
+    vals = vals[np.isfinite(vals)]
+    return float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5))
+
+
 # ====================================================================== #
 # Main
 # ====================================================================== #
@@ -221,7 +253,8 @@ def evaluate(args):
         if splits[i] == 0:
             continue
         tasks.append((i, splits[i], args.agent_checkpoint, args.sl_discard,
-                       args.sl_frozen, args.weak_dir, device, args.seed))
+                       args.sl_frozen, args.weak_dir, device, args.seed,
+                       args.sample, sum(splits[:i])))
 
     print(f"[eval] lancement de {len(tasks)} workers...", flush=True)
 
@@ -240,6 +273,8 @@ def evaluate(args):
     total = n1 + n2 + n3 + n4
 
     sr = compute_stable_rank(n1, n2, n4)
+    mr, mr_ci = mean_rank_ci(n1, n2, n3, n4)
+    sr_lo, sr_hi = stable_rank_ci(n1, n2, n3, n4)
 
     print(f"\n=== RESULTAT FINAL ===")
     print(f"  Games     : {total}")
@@ -248,7 +283,14 @@ def evaluate(args):
     print(f"  2nd rate  : {n2/total:.4f}")
     print(f"  3rd rate  : {n3/total:.4f}")
     print(f"  4th rate  : {n4/total:.4f}")
-    print(f"  Stable rank (Tenhou) : {sr:.4f}")
+    print(f"  Rang moyen           : {mr:.3f} +- {mr_ci:.3f} (95 %)  "
+          f"[2.500 = niveau egal]")
+    print(f"  Stable rank (Tenhou) : {sr:.4f}  IC95 [{sr_lo:.2f}, {sr_hi:.2f}]")
+    print(f"  Mode joueur eval     : "
+          f"{'echantillonne' if args.sample else 'argmax'}, sieges alternes")
+    if total < 1000:
+        print(f"  !! {total} parties : trop peu pour conclure "
+              f"(viser >= 1000, IC ci-dessus).")
     print(f"  Duree     : {elapsed:.1f}s ({total/elapsed:.2f} games/s)")
 
 
@@ -262,6 +304,9 @@ def main():
     p.add_argument('--n-workers', type=int, default=4,
                    help='nombre de workers paralleles (defaut 4)')
     p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--sample', action='store_true',
+                   help='le RL echantillonne sa politique (comme a '
+                        "l'entrainement) au lieu de l'argmax")
     args = p.parse_args()
     evaluate(args)
 
