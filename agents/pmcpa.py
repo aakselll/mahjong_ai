@@ -28,6 +28,8 @@ import copy
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures import as_completed
 
 import numpy as np
 import torch
@@ -146,7 +148,7 @@ class PMCPA:
     def __init__(self, models, head_sizes, device='cpu',
                  k=50, lr=1e-4, grad_steps=3, timeout_s=20.0,
                  reward_scale=DEFAULT_ROUND_REWARD_SCALE,
-                 verbose=True):
+                 verbose=True, n_workers=None):
         self.device = device
         self.k = int(k)
         self.lr = float(lr)
@@ -154,6 +156,11 @@ class PMCPA:
         self.timeout_s = float(timeout_s)
         self.reward_scale = float(reward_scale)
         self.verbose = bool(verbose)
+        configured_workers = (
+            os.environ.get("PMCPA_N_WORKERS", "4")
+            if n_workers is None else n_workers
+        )
+        self.n_workers = max(1, int(configured_workers))
 
         self.models = models
         self.discard = models['discard']
@@ -273,7 +280,8 @@ class PMCPA:
         try:
             if self.verbose:
                 print(f"[pMCPA] debut adaptation (main={hand_counts.sum()} "
-                      f"tuiles, K={self.k})", flush=True)
+                      f"tuiles, K={self.k}, workers={self.n_workers})",
+                      flush=True)
 
             trajectories = self._simulate_k_rounds(hand_counts, state)
 
@@ -299,61 +307,87 @@ class PMCPA:
 
     # ------------------------------------------------------------------ #
     def _simulate_k_rounds(self, our_hand, sniffer_state):
-        """Simule K manches avec la policy offline.
+        """Simule K manches avec la policy offline en parallele.
 
-        [FIX] Cree l'env UNE SEULE FOIS. Timeout via t_start unique.
+        Chaque worker possede son propre environnement et son propre RNG.
+        Les simulations ne modifient pas les poids : l'adaptation est
+        effectuee ensuite dans le thread principal.
         """
-        from mahjong_ai.envs.multi_agent import MultiAgentMahjongEnv
-
         trajectories = []
         rng = np.random.RandomState(int(time.time() * 1000) & 0x7fffffff)
 
         offline_state = copy.deepcopy(self.discard.state_dict())
         self.discard.eval()
 
-        base_env = MultiAgentMahjongEnv(
-            seed=int(rng.randint(0, 2**31 - 1)),
-            compute_lookahead=False,
-        )
-
         t_start = time.time()
 
-        for k in range(self.k):
-            if time.time() - t_start > self.timeout_s:
-                if self.verbose:
-                    print(f"[pMCPA] timeout sims a k={k}/{self.k} "
-                          f"({time.time()-t_start:.1f}s)", flush=True)
-                break
+        # Les seeds sont generees dans le thread principal afin d'eviter
+        # tout partage de RandomState entre workers.
+        tasks = [
+            (
+                i,
+                np.random.RandomState(int(rng.randint(0, 2**31 - 1))),
+            )
+            for i in range(self.k)
+        ]
 
+        def simulate(task):
+            simulation_id, simulation_rng = task
             try:
-                traj = self._simulate_one_round(
-                    our_hand, sniffer_state, rng, offline_state, base_env)
-                if traj is not None:
-                    trajectories.append(traj)
-                    if self.verbose and (k + 1) % 5 == 0:
-                        print(f"[pMCPA] sim {k+1}/{self.k} OK "
-                              f"({time.time()-t_start:.1f}s, "
-                              f"{len(traj['trajectory'])} transitions, "
-                              f"reward={traj['reward']:+.1f})", flush=True)
-            except Exception as e:
+                trajectory = self._simulate_one_round(
+                    our_hand, sniffer_state, simulation_rng, offline_state)
+                return simulation_id, trajectory, None
+            except Exception as exc:
+                return simulation_id, None, exc
+
+        with ThreadPoolExecutor(
+                max_workers=min(self.n_workers, max(1, self.k)),
+                thread_name_prefix="pmcpa-sim") as executor:
+            futures = [executor.submit(simulate, task) for task in tasks]
+            try:
+                for future in as_completed(futures, timeout=self.timeout_s):
+                    simulation_id, trajectory, error = future.result()
+                    if error is not None:
+                        if self.verbose:
+                            print(f"[pMCPA] sim {simulation_id} echouee : "
+                                  f"{error}", flush=True)
+                        continue
+                    if trajectory is not None:
+                        trajectories.append(trajectory)
+                        if self.verbose:
+                            elapsed = time.time() - t_start
+                            print(f"[pMCPA] sim {simulation_id + 1}/{self.k} "
+                                  f"OK ({elapsed:.1f}s, "
+                                  f"{len(trajectory['trajectory'])} "
+                                  f"transitions, "
+                                  f"reward={trajectory['reward']:+.1f})",
+                                  flush=True)
+            except FuturesTimeoutError:
                 if self.verbose:
-                    print(f"[pMCPA] sim {k} echouee : {e}", flush=True)
-                continue
+                    completed = len(trajectories)
+                    print(f"[pMCPA] timeout sims a {completed}/{self.k} "
+                          f"({time.time()-t_start:.1f}s)", flush=True)
+                for future in futures:
+                    future.cancel()
 
         self.discard.train()
         return trajectories
 
     # ------------------------------------------------------------------ #
     def _simulate_one_round(self, our_hand, sniffer_state, rng,
-                            offline_state, base_env):
-        """Simule UNE manche complete en reutilisant base_env."""
+                            offline_state=None, base_env=None):
+        """Simule UNE manche complete dans un environnement independant."""
         from mahjong_ai.envs.multi_agent import (
             DISCARD, PONG, CHOW, KONG, RIICHI, RON,
         )
+        from mahjong_ai.envs.multi_agent import MultiAgentMahjongEnv
 
         MAX_STEPS = 500
 
-        env = base_env
+        env = MultiAgentMahjongEnv(
+            seed=int(rng.randint(0, 2**31 - 1)),
+            compute_lookahead=False,
+        )
         env.rng = np.random.RandomState(int(rng.randint(0, 2**31 - 1)))
 
         sampled = _sample_round_state(our_hand, rng)
