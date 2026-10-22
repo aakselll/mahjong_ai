@@ -9,6 +9,7 @@ Conforme au papier §3.3 (oracle guiding) :
 Une fois γ=0, l'agent devient "normal" (250 canaux effectifs, les 136
 autres à zéro). C'est ce qui permet de déployer l'agent sans info parfaite.
 """
+import copy
 import numpy as np
 import torch
 import torch.nn as nn
@@ -61,6 +62,18 @@ class OracleDiscardAgent:
               f"(val_acc={ck.get('val_acc','?')}, "
               f"arch={channels}x{n_blocks})", flush=True)
 
+        # [ANCRE KL] Copie GELEE de la policy SL de depart. Sert de
+        # reference pour la penalite KL(pi || pi_SL) : sans ancrage le
+        # self-play symetrique derive vers des politiques passives (run
+        # 15M : 38 pourcent d'exhaustive draws, rang moyen 2.68 vs 2.50
+        # pour le SL). Construite ICI (depuis le SL), donc inchangee par un
+        # --resume qui ne charge que les poids de self.policy.
+        self.ref_policy = copy.deepcopy(self.policy).eval()
+        for _p in self.ref_policy.parameters():
+            _p.requires_grad = False
+        self.compute_kl = False       # active par la boucle (--kl-coef > 0)
+        self.last_kl = None
+
         # --- Critic ---
         self.critic = Critic().to(device)
 
@@ -94,6 +107,24 @@ class OracleDiscardAgent:
                                              lr=policy_lr)
         self.critic_optim = torch.optim.Adam(self.critic.parameters(),
                                              lr=critic_lr)
+
+        # [FIX BATCHNORM] La policy contient des BatchNorm2d (tronc + 16
+        # blocs). Un module fraichement construit est en mode train : en
+        # rollout (select_action, batch de 1) la BN normaliserait alors
+        # chaque canal sur les seuls 34 emplacements de l'etat courant au
+        # lieu d'utiliser les stats du SL, et evaluate_actions (batch de
+        # ~1000) utiliserait d'autres stats encore -> la policy qui joue
+        # n'est pas celle du checkpoint SL et le ratio PPO est du bruit.
+        # En eval, les stats SL sont figees (les gradients, eux, passent
+        # normalement, et gamma/beta de la BN restent entrainables).
+        self.policy.eval()
+
+    def set_eval_mode(self):
+        """Remet la policy en eval (BN figee). A rappeler apres tout
+        load_state_dict / resume : load_state_dict ne change pas le mode,
+        mais un .train() externe l'aurait change."""
+        self.policy.eval()
+        self.critic.eval()
 
     def _load_partial_sl(self, state_dict):
         """Charge partiellement : le trunk (conv_in) attend 386 canaux mais
@@ -214,7 +245,19 @@ class OracleDiscardAgent:
         log_probs = torch.log_softmax(masked_logits, dim=-1)
         probs = torch.exp(log_probs)
         entropy = -(probs * log_probs).sum(dim=-1)
-        
+
+        # [ANCRE KL] KL(pi || pi_SL) moyenne sur les etats du batch, avec
+        # gradient vers pi. Stockee dans self.last_kl (la signature de
+        # retour est inchangee). Memes etats et memes masques que pi.
+        if self.compute_kl:
+            with torch.no_grad():
+                ref_logits = self.ref_policy(x) + (mask_t - 1.0) * 1e9
+                ref_log_probs = torch.log_softmax(ref_logits, dim=-1)
+            self.last_kl = (probs * (log_probs - ref_log_probs)
+                            ).sum(dim=-1).mean()
+        else:
+            self.last_kl = None
+
         return logp, values.squeeze(-1), entropy
 
     # ------------------------------------------------------------------ #

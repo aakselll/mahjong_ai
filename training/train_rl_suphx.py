@@ -38,18 +38,19 @@ Boucle principale d'entrainement RL Suphx.
     rangs, longueur des parties, distribution des fins de manche.
 
 Usage :
-    py -3.14 -m mahjong_ai.training.train_rl_suphx ^
-        --sl-discard checkpoints/sl_tonpusen_light/discard.pt ^
-        --sl-frozen checkpoints/sl_tonpusen_light ^
-        --grp-checkpoint checkpoints/grp_tonpusen.pt ^
-        --total-steps 500000 --n-workers 4 ^
-        --h-target 1.6 --alpha-max 0.15 --value-coef 0.0 ^
-        --oracle-frac 0.10 --transition-frac 0.30 ^
-        --save-every 25000 --keep-last-n 3 --publish-every 5000 ^
+    py -3.14 -m mahjong_ai.training.train_rl_suphx `
+        --sl-discard checkpoints/sl_tonpusen_light/discard.pt `
+        --sl-frozen checkpoints/sl_tonpusen_light `
+        --grp-checkpoint checkpoints/grp_tonpusen.pt `
+        --total-steps 500000 --n-workers 4 `
+        --h-target 1.6 --alpha-max 0.15 --value-coef 0.0 `
+        --oracle-frac 0.10 --transition-frac 0.30 `
+        --save-every 25000 --keep-last-n 3 --publish-every 5000 `
         --output checkpoints/rl_tonpusen_v2/rl_discard.pt
 """
 import argparse
 import collections
+import gc
 import multiprocessing as mp
 import os
 import threading
@@ -57,6 +58,11 @@ import time
 
 import numpy as np
 import torch
+
+try:                      # garde memoire optionnelle : pip install psutil
+    import psutil
+except ImportError:
+    psutil = None
 
 from mahjong_ai.agents.oracle_agent import OracleDiscardAgent
 from mahjong_ai.training.parameter_server import (
@@ -77,6 +83,10 @@ STATS_KEYS_INIT = {
     'n_tsumo': 0, 'n_ron': 0, 'n_exhaustive': 0,
     'n_abortive': 0,
     'n_riichi': 0,
+    'n_pon': 0, 'n_chi': 0, 'n_kan': 0,
+    'n_ron_refused': 0,
+    'n_sl_errors': 0,       # doit rester 0 (tete SL figee en erreur)
+    'n_unhandled': 0,       # doit rester 0 (requete non-DISCARD inattendue)
 }
 
 
@@ -109,9 +119,20 @@ def format_game_stats(stats_proxy):
     exh_pct = 100 * n_exh / max(total_ends, 1)
     ab_pct = 100 * n_ab / max(total_ends, 1)
 
-    return (
+    # [STATS] Taux par manche (4 joueurs confondus). n_rounds_total compte
+    # les manches de toutes les parties.
+    n_rounds_total = max(stats_proxy.get('n_rounds_total', 0), 1)
+    riichi_rnd = stats_proxy.get('n_riichi', 0) / n_rounds_total
+    calls_rnd = (stats_proxy.get('n_pon', 0) + stats_proxy.get('n_chi', 0)
+                 + stats_proxy.get('n_kan', 0)) / n_rounds_total
+    refused_rnd = stats_proxy.get('n_ron_refused', 0) / n_rounds_total
+
+    line = (
         f"n={n_games} "
         f"[{n1}/{n2}/{n3}/{n4}] "
+        # NB : wr/mean_rank concernent le siege 0 ; les 4 sieges partagent
+        # la meme policy -> esperance 0.25 / 2.50 par symetrie. Ce n'est
+        # PAS une mesure de progres (utiliser eval_stable_rank vs SL).
         f"wr={win_rate:.3f} "
         f"mean_rank={mean_rank:.2f} "
         f"rounds={mean_rounds:.2f} "
@@ -119,8 +140,16 @@ def format_game_stats(stats_proxy):
         f"tsumo%={tsumo_pct:.0f} "
         f"ron%={ron_pct:.0f} "
         f"exh%={exh_pct:.0f} "
-        f"ab%={ab_pct:.0f}"
+        f"ab%={ab_pct:.0f} "
+        f"riichi/rnd={riichi_rnd:.2f} "
+        f"calls/rnd={calls_rnd:.2f} "
+        f"ron_refus/rnd={refused_rnd:.2f}"
     )
+    n_err = stats_proxy.get('n_sl_errors', 0)
+    n_unh = stats_proxy.get('n_unhandled', 0)
+    if n_err or n_unh:
+        line += f" !!SL_ERR={n_err} !!UNHANDLED={n_unh}"
+    return line
 
 
 def _purge_old_checkpoints(base_path, keep_n):
@@ -135,6 +164,29 @@ def _purge_old_checkpoints(base_path, keep_n):
                 print(f"[purge] supprime {f}", flush=True)
             except OSError:
                 pass
+
+
+# ---------------------------------------------------------------------- #
+# Garde memoire
+# ---------------------------------------------------------------------- #
+def apply_mem_guard(rb_local, rb_lock, buf_cap, mem_pct, limit_pct, floor):
+    """Reduit durablement la capacite du buffer si la RAM depasse le seuil.
+
+    buf_cap : liste a 1 element (capacite en parties, lue par le thread de
+              drain). Ne remonte jamais d'elle-meme.
+    Retourne (action, n_supprimees, capacite) ; action = None (RAM ok),
+    'shrunk' (buffer reduit) ou 'at_floor' (deja au plancher).
+    """
+    if mem_pct is None or mem_pct < limit_pct:
+        return None, 0, buf_cap[0]
+    with rb_lock:
+        new_cap = max(floor, len(rb_local) // 2)
+        if new_cap < buf_cap[0]:
+            buf_cap[0] = new_cap
+            n_drop = max(0, len(rb_local) - new_cap)
+            del rb_local[:n_drop]
+            return 'shrunk', n_drop, new_cap
+    return 'at_floor', 0, buf_cap[0]
 
 
 # ---------------------------------------------------------------------- #
@@ -268,6 +320,10 @@ def pg_is_loss(agent, transitions, advantages, gamma_t,
     new_logp, values, entropy = agent.evaluate_actions(
         obs_n, obs_o, masks, actions, gamma_t)
     ratio = torch.exp(new_logp - old_logp)
+    # [DIAG] ecart moyen du ratio a 1 (lu par la boucle a l'epoch 0).
+    # NB : non nul meme sans bug, car le buffer est un replay et les
+    # workers jouent avec des poids publies tous les --publish-every steps.
+    agent.last_ratio_dev = float((ratio.detach() - 1.0).abs().mean().item())
 
     if phase == 3 and iw_threshold is not None:
         keep = (ratio <= iw_threshold).float()
@@ -313,6 +369,15 @@ def train(args):
           f"h_target={args.h_target}, beta={args.beta}",
           flush=True)
 
+    # [H-TARGET AUTO] --h-target auto : la cible est l'entropie MESUREE de
+    # la policy au demarrage (moyenne des --h-calib-updates premiers
+    # updates, avant tout pas de gradient significatif), x --h-target-mult.
+    # Evite une cible inatteignable qui pousse alpha au cap en permanence
+    # (cf. logs : H 1.03 -> 1.65 avec h_target=1.6 et alpha colle a 0.15).
+    h_auto = str(args.h_target).strip().lower() == 'auto'
+    h_target = None if h_auto else float(args.h_target)
+    h_calib = []
+
     # --- Parameter server (etat LEGER : poids, alpha, gamma) + Queue ---
     ps = ParameterServer()
     stats_proxy = ps.manager.dict()
@@ -324,16 +389,27 @@ def train(args):
     # Manager sollicitee par 4 workers a chaque partie -- tuait le serveur
     # Manager sous Windows au bout de ~75 min de charge IPC. Le Manager ne
     # porte plus desormais que l'etat leger (poids, stats).
-    transitions_queue = mp.Queue(maxsize=args.buffer_size)
+    #
+    # [FIX MEMOIRE] La Queue ne doit PAS etre dimensionnee comme le buffer :
+    # chaque element est une PARTIE entiere (~400 coups x 268x34 float32 =
+    # ~15 Mo) et le feeder thread de chaque worker garde une copie non
+    # serialisee de tout ce qui attend d'entrer dans le pipe. Avec
+    # maxsize=500 on pouvait empiler plusieurs Go cote workers EN PLUS du
+    # buffer du trainer (MemoryError a ~2.46M steps). Le thread de drain
+    # vide la Queue en continu : quelques elements suffisent.
+    queue_size = args.queue_size or max(4, 2 * args.n_workers)
+    transitions_queue = mp.Queue(maxsize=queue_size)
 
     # Buffer LOCAL au process principal : liste ordinaire protegee par un
     # lock, remplie par un thread daemon qui draine la Queue.
     rb_local = []
     rb_lock = threading.Lock()
+    # Capacite du buffer (en parties), modifiable par la garde memoire.
+    buf_cap = [args.buffer_size]
 
     import queue as _queue_mod
 
-    def _drain_queue(q, rb_list, lock, buffer_max):
+    def _drain_queue(q, rb_list, lock, cap):
         """Draine la Queue vers le buffer local (thread daemon).
 
         get(timeout=1.0) : le thread verifie periodiquement s'il doit
@@ -344,7 +420,7 @@ def train(args):
                 item = q.get(timeout=1.0)
                 with lock:
                     rb_list.append(item)
-                    while len(rb_list) > buffer_max:
+                    while len(rb_list) > cap[0]:
                         rb_list.pop(0)
             except _queue_mod.Empty:
                 continue
@@ -354,10 +430,19 @@ def train(args):
 
     drain_thread = threading.Thread(
         target=_drain_queue,
-        args=(transitions_queue, rb_local, rb_lock, args.buffer_size),
+        args=(transitions_queue, rb_local, rb_lock, buf_cap),
         daemon=True,
     )
     drain_thread.start()
+
+    # [FIX MEMOIRE] garde RAM (optionnelle, necessite psutil)
+    def _mem_percent():
+        return psutil.virtual_memory().percent if psutil is not None else None
+
+    print(f"[train_rl] memoire : buffer={args.buffer_size} parties, "
+          f"queue={queue_size}, garde RAM "
+          f"{'>= %.0f%%' % args.mem_limit_pct if psutil else 'INACTIVE (pip install psutil)'}",
+          flush=True)
 
     # --- Agent ---
     agent = OracleDiscardAgent(
@@ -379,7 +464,20 @@ def train(args):
             agent.policy.load_state_dict(ck['policy'])
             agent.critic.load_state_dict(ck['critic'])
             start_step = ck.get('step', 0) or 0
-            start_alpha = ck.get('alpha', args.alpha_init) or args.alpha_init
+            # [FIX ALPHA-RESUME] priorite : --alpha-resume explicite >
+            # alpha du checkpoint > --alpha-init.
+            if args.alpha_resume is not None:
+                start_alpha = args.alpha_resume
+                print(f"[train_rl]   alpha : --alpha-resume "
+                      f"({start_alpha:.4f}) prioritaire", flush=True)
+            elif ck.get('alpha') is not None:
+                start_alpha = float(ck['alpha'])
+                print(f"[train_rl]   alpha : repris du checkpoint "
+                      f"({start_alpha:.4f})", flush=True)
+            else:
+                print(f"[train_rl]   alpha : absent du checkpoint (ancien "
+                      f"format) -> {start_alpha:.4f} ; utiliser "
+                      f"--alpha-resume pour le fixer", flush=True)
 
             # Extraction depuis le nom si step=0 (anciens checkpoints)
             if start_step == 0:
@@ -394,6 +492,17 @@ def train(args):
                   flush=True)
         except Exception as e:
             print(f"[train_rl] ECHEC resume : {e}", flush=True)
+
+    # [FIX BATCHNORM] Policy en eval : stats BN du SL figees, identiques
+    # entre rollout (batch 1) et update (batch ~1000).
+    agent.set_eval_mode()
+    print(f"[train_rl] policy.training={agent.policy.training} "
+          f"(doit etre False)", flush=True)
+    if args.resume:
+        print("[train_rl] ATTENTION : un checkpoint RL produit AVANT ce fix "
+              "contient des running stats BN polluees par le mode train. "
+              "Repartir du SL (sans --resume) pour un test propre.",
+              flush=True)
 
     # --- Publish initial ---
     publish_to_state(
@@ -431,6 +540,26 @@ def train(args):
     current_phase, _, _ = get_phase_and_gamma(
         step, args.total_steps, args.oracle_frac, args.transition_frac)
     base_lr = args.lr
+    agent.compute_kl = args.kl_coef > 0
+    print(f"[train_rl] ancre KL vers le SL : coef={args.kl_coef} "
+          f"({'ON' if agent.compute_kl else 'OFF'}) ; checkpoints jalons "
+          f"tous les {args.milestone_every} steps", flush=True)
+    last_milestone = start_step // args.milestone_every \
+        if args.milestone_every > 0 else 0
+    # [FIX LR-RESUME] Les facteurs de LR n'etaient appliques qu'au CHANGEMENT
+    # de phase : un resume directement en phase 2/3 gardait le LR plein.
+    # L'optimizer n'est pas sauvegarde -> on applique le facteur ici.
+    if current_phase != 1:
+        _, _, _lrf = get_phase_and_gamma(
+            step, args.total_steps, args.oracle_frac, args.transition_frac)
+        _cf = {1: 1.0, 2: 0.5, 3: 0.1}[current_phase]
+        for pg in agent.policy_optim.param_groups:
+            pg['lr'] = base_lr * _lrf
+        for pg in agent.critic_optim.param_groups:
+            pg['lr'] = args.critic_lr * _cf
+        print(f"[train_rl] resume en phase {current_phase} : "
+              f"policy lr={base_lr * _lrf:.2e} (x{_lrf}), "
+              f"critic lr={args.critic_lr * _cf:.2e}", flush=True)
     t_start = time.time()
     n_updates = 0
 
@@ -438,8 +567,28 @@ def train(args):
     # d'urgence) -- calcule une fois, hors de la boucle.
     base_out = args.output[:-3] if args.output.endswith('.pt') else args.output
 
+    last_mem_warn = 0.0
     try:
         while step < args.total_steps:
+            # [FIX MEMOIRE] Garde RAM : si la memoire systeme depasse le
+            # seuil, on reduit durablement la capacite du buffer (et on le
+            # tronque) plutot que de mourir en MemoryError. Plancher : 2x
+            # batch_episodes, pour ne jamais affamer l'entrainement.
+            mem_pct = _mem_percent()
+            guard, n_drop, new_cap = apply_mem_guard(
+                rb_local, rb_lock, buf_cap, mem_pct, args.mem_limit_pct,
+                floor=max(2 * args.batch_episodes, 1))
+            if guard == 'shrunk':
+                gc.collect()
+                print(f"[mem] RAM {mem_pct:.0f}% >= "
+                      f"{args.mem_limit_pct:.0f}% : capacite buffer -> "
+                      f"{new_cap} parties ({n_drop} supprimees)", flush=True)
+            elif guard == 'at_floor' and time.time() - last_mem_warn > 60:
+                last_mem_warn = time.time()
+                print(f"[mem] RAM {mem_pct:.0f}% : buffer deja au plancher "
+                      f"({buf_cap[0]} parties) -- fermer d'autres programmes "
+                      f"ou baisser --n-workers", flush=True)
+
             # [NIVEAU 2] Echantillonnage depuis le buffer local.
             # [NIVEAU 2] Echantillonnage depuis le buffer local.
             # [FIX FORMAT] rb_local contient des EPISODES (listes de
@@ -504,6 +653,9 @@ def train(args):
             policy_gnorm_last = None
             critic_gnorm_last = None
 
+            entropy_first = None
+            ratio_dev_first = None
+            kl_last = None
             for epoch_i in range(PPO_EPOCHS):
                 agent.policy_optim.zero_grad()
                 agent.critic_optim.zero_grad()
@@ -513,7 +665,14 @@ def train(args):
                     clip_eps=args.clip_eps, iw_threshold=iw_thresh, phase=phase)
                 if policy_loss is None:
                     break
+                if epoch_i == 0:
+                    entropy_first = entropy.item()
+                    ratio_dev_first = getattr(agent, 'last_ratio_dev', None)
                 loss = policy_loss + args.value_coef * value_loss - alpha * entropy
+                kl_t = getattr(agent, 'last_kl', None)
+                if args.kl_coef > 0 and kl_t is not None:
+                    loss = loss + args.kl_coef * kl_t
+                    kl_last = float(kl_t.detach().item())
                 loss.backward()
                 policy_gnorm_last = torch.nn.utils.clip_grad_norm_(
                     agent.policy.parameters(), 5.0)
@@ -527,6 +686,16 @@ def train(args):
 
             if policy_loss_last is None:
                 continue
+
+            # [H-TARGET AUTO] calibration sur l'entropie de depart
+            if h_target is None and entropy_first is not None:
+                h_calib.append(entropy_first)
+                if len(h_calib) >= args.h_calib_updates:
+                    h_target = float(np.mean(h_calib)) * args.h_target_mult
+                    print(f"[train_rl] h_target auto = {h_target:.4f} "
+                          f"(moyenne de {len(h_calib)} updates x "
+                          f"{args.h_target_mult})", flush=True)
+
             policy_loss = policy_loss_last
             value_loss = value_loss_last
             entropy = entropy_last
@@ -542,14 +711,14 @@ def train(args):
             recent_entropies.append(entropy.item())
             if len(recent_entropies) > 50:
                 recent_entropies.pop(0)
-            if len(recent_entropies) >= 3:
+            if len(recent_entropies) >= 3 and h_target is not None:
                 h_bar = np.mean(recent_entropies)
                 # [FIX ALPHA] Cap : sans lui, alpha monte sans fin quand
                 # H_target est inatteignable (policy discard competente
                 # plafonne a H~1.7). Run 600k precedent : alpha=0.41 final,
                 # bonus d'entropie ~7x la policy loss -> policy aplatie ->
                 # 34 pourcent de 4es places contre 25 attendu.
-                raw_update = alpha + args.beta * (args.h_target - h_bar)
+                raw_update = alpha + args.beta * (h_target - h_bar)
                 if args.alpha_max > 0:
                     alpha = max(0.0, min(raw_update, args.alpha_max))
                 else:
@@ -568,17 +737,35 @@ def train(args):
             if step % args.log_every < len(batch):
                 with rb_lock:
                     current_buf = len(rb_local)
+                    last_ep = rb_local[-1] if rb_local else None
+                # [MEMOIRE] taille REELLE du buffer (estimee sur la derniere
+                # partie recue) et RAM systeme.
+                buf_mb = 0.0
+                if last_ep:
+                    ep_bytes = sum(t['obs_normal'].nbytes
+                                   + t['obs_oracle'].nbytes
+                                   + t['mask'].nbytes for t in last_ep)
+                    buf_mb = ep_bytes * current_buf / 1e6
+                ram_pct = _mem_percent()
+                mem_info = (f"({buf_mb:.0f}MB"
+                            + (f",ram={ram_pct:.0f}%" if ram_pct is not None
+                               else "") + ")")
                 elapsed = time.time() - t_start
                 metrics = compute_drift_metrics(batch)
                 alerts = check_drift_alerts(metrics, phase)
+                rdev_str = (f"{ratio_dev_first:.3f}"
+                            if ratio_dev_first is not None else "n/a")
+                kl_str = f"{kl_last:.4f}" if kl_last is not None else "off"
 
                 print(f"[step {step:7d} | phase {phase}] "
                       f"pl={policy_loss.item():+.4f} "
                       f"vl={value_loss.item():.4f} "
                       f"H={entropy.item():.4f} "
                       f"alpha={alpha:.4f} "
+                      f"rdev={rdev_str} "
+                      f"kl={kl_str} "
                       f"gamma={gamma_t:.3f} "
-                      f"buf={current_buf} "
+                      f"buf={current_buf}{mem_info} "
                       f"({elapsed:.0f}s)", flush=True)
 
                 if metrics is not None:
@@ -605,37 +792,69 @@ def train(args):
                 for a in alerts:
                     print(f"    | !! {a}", flush=True)
 
+                # [FAIL-FAST] Une tete SL figee en erreur (ou une requete
+                # non-DISCARD inattendue) fausse toutes les parties : plus de
+                # riichi/pon/chow corrects. S'entrainer dessus est du temps
+                # perdu -> on s'arrete (sauf --allow-sl-errors).
+                n_err = stats_proxy.get('n_sl_errors', 0)
+                n_unh = stats_proxy.get('n_unhandled', 0)
+                if (n_err or n_unh) and not args.allow_sl_errors:
+                    raise RuntimeError(
+                        f"tetes SL figees en erreur (n_sl_errors={n_err}, "
+                        f"n_unhandled={n_unh}) : parties invalides. "
+                        f"Voir le traceback [env] plus haut. "
+                        f"--allow-sl-errors pour ignorer.")
+
             if step % args.save_every < len(batch):
                 os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
                 step_path = f"{base_out}_step{step:07d}.pt"
                 latest_path = f"{base_out}_latest.pt"
                 # [FIX RESUME] step passe au save -> le checkpoint contient
                 # le step reel, plus besoin du regex sur le nom.
-                agent.save(step_path, step=step)
-                agent.save(latest_path, step=step)
+                agent.save(step_path, step=step, alpha=alpha)
+                agent.save(latest_path, step=step, alpha=alpha)
                 if args.keep_last_n > 0:
                     _purge_old_checkpoints(base_out, args.keep_last_n)
+                # [JALONS] checkpoints JAMAIS purges, pour evaluer plus tard
+                # (eval_checkpoints.py) et reprendre le meilleur : le dernier
+                # n'est pas forcement le meilleur.
+                if (args.milestone_every > 0
+                        and step // args.milestone_every > last_milestone):
+                    last_milestone = step // args.milestone_every
+                    ms_path = f"{base_out}_milestone{step:09d}.pt"
+                    agent.save(ms_path, step=step, alpha=alpha)
+                    print(f"[step {step}] jalon {ms_path}", flush=True)
                 print(f"[step {step}] save {step_path} + {latest_path}",
                       flush=True)
 
     except (BrokenPipeError, ConnectionError, ConnectionResetError,
-            EOFError, IndexError, OSError) as e:
+            EOFError, IndexError, OSError, MemoryError) as e:
         # [FIX CRASH] Sauvegarde d'URGENCE avant de mourir. Le serveur
         # Manager sous Windows peut mourir sous la charge IPC : tous les
         # proxies deviennent invalides en cascade. Sans ce bloc, perte
         # totale du run si le crash arrive avant save_every.
+        # [FIX MEMOIRE] MemoryError ajoute (il n'etait pas capture : aucun
+        # checkpoint de crash n'avait ete ecrit). On libere d'abord le
+        # buffer pour avoir la place d'ecrire.
+        try:
+            with rb_lock:
+                rb_local.clear()
+            gc.collect()
+        except Exception:
+            pass
         print(f"\n[train_rl] !!! CRASH a step={step} : "
               f"{type(e).__name__}: {e}", flush=True)
         print(f"[train_rl] Sauvegarde d'URGENCE des poids...", flush=True)
         try:
             os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
             emergency_path = f"{base_out}_crash_step{step:07d}.pt"
-            agent.save(emergency_path, step=step)
+            agent.save(emergency_path, step=step, alpha=alpha)
             print(f"[train_rl] Poids sauvegardes : {emergency_path}",
                   flush=True)
             print(f"[train_rl] Pour reprendre :", flush=True)
             print(f"[train_rl]   --resume {emergency_path} "
-                  f"--alpha-resume {alpha:.4f}", flush=True)
+                  f"(alpha={alpha:.4f} sauvegarde dans le checkpoint)",
+                  flush=True)
         except Exception as e2:
             print(f"[train_rl] ECHEC sauvegarde d'urgence : {e2}", flush=True)
             print(f"[train_rl] Dernier checkpoint valide : cherchez "
@@ -643,7 +862,7 @@ def train(args):
         raise
 
     # --- Fin normale ---
-    agent.save(args.output, step=step)
+    agent.save(args.output, step=step, alpha=alpha)
     print(f"[train_rl] termine. Checkpoint : {args.output}", flush=True)
 
     # [NIVEAU 2] Fermeture propre de la Queue : close + join_thread
@@ -669,7 +888,16 @@ def main():
     p.add_argument('--total-steps', type=int, default=1000000)
     p.add_argument('--n-workers', type=int, default=4)
     p.add_argument('--games-per-cycle', type=int, default=10)
-    p.add_argument('--buffer-size', type=int, default=500)
+    p.add_argument('--buffer-size', type=int, default=150,
+                   help="capacite du buffer, en PARTIES (~15 Mo chacune en "
+                        "float16 : 150 parties ~ 1.5-3 Go). Etait 500 "
+                        "(7+ Go) -> MemoryError.")
+    p.add_argument('--queue-size', type=int, default=None,
+                   help="taille de la mp.Queue (defaut : max(4, 2*n_workers)). "
+                        "Doit rester PETITE : chaque element est une partie.")
+    p.add_argument('--mem-limit-pct', type=float, default=88.0,
+                   help="seuil de RAM systeme (%%) au-dela duquel le buffer "
+                        "est reduit (necessite psutil)")
     p.add_argument('--batch-episodes', type=int, default=20)
     p.add_argument('--max-batch-transitions', type=int, default=1000)
 
@@ -679,7 +907,17 @@ def main():
     p.add_argument('--lam', type=float, default=0.95)
     p.add_argument('--clip-eps', type=float, default=0.2)
     p.add_argument('--value-coef', type=float, default=0.5)
-    p.add_argument('--h-target', type=float, default=2.0)
+    p.add_argument('--h-target', type=str, default='2.0',
+                   help="entropie cible (Eq. 3) : un nombre, ou 'auto' = "
+                        "entropie mesuree de la policy au demarrage "
+                        "(voir --h-calib-updates / --h-target-mult)")
+    p.add_argument('--allow-sl-errors', action='store_true',
+                   help="ne pas s'arreter si une tete SL figee echoue "
+                        "(deconseille : parties invalides)")
+    p.add_argument('--h-calib-updates', type=int, default=5,
+                   help="nb d'updates moyennes pour --h-target auto")
+    p.add_argument('--h-target-mult', type=float, default=1.0,
+                   help="facteur applique a la cible auto (ex. 1.1)")
     p.add_argument('--alpha-init', type=float, default=0.01)
     p.add_argument('--beta', type=float, default=0.005)
     p.add_argument('--alpha-max', type=float, default=0.15,
@@ -697,6 +935,13 @@ def main():
 
     p.add_argument('--iw-threshold', type=float, default=5.0)
     p.add_argument('--keep-last-n', type=int, default=0)
+    p.add_argument('--kl-coef', type=float, default=0.05,
+                   help='[ANCRE] poids de KL(pi || pi_SL) dans la loss. '
+                        '0 = desactive. Plage utile 0.02-0.2 : trop bas -> '
+                        'derive passive ; trop haut -> reste colle au SL.')
+    p.add_argument('--milestone-every', type=int, default=1000000,
+                   help='un checkpoint *_milestoneN.pt jamais purge tous '
+                        'les N steps (0 = desactive)')
 
     p.add_argument('--publish-every', type=int, default=2000)
     p.add_argument('--save-every', type=int, default=50000)
@@ -708,7 +953,8 @@ def main():
                    help='nombre d epochs PPO par batch (defaut 3)')
 
     p.add_argument('--alpha-resume', type=float, default=None,
-                   help='valeur de alpha au resume (defaut: args.alpha_init)')
+                   help='alpha au resume ; prioritaire sur le checkpoint '
+                        '(defaut: alpha du checkpoint, sinon --alpha-init)')
 
     args = p.parse_args()
     train(args)

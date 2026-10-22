@@ -102,6 +102,8 @@ def worker_loop(worker_id, state, lock, transitions_queue,
                 agent.critic.load_state_dict(critic_state)
             except Exception as e:
                 print(f"[worker {worker_id}] load error : {e}", flush=True)
+        # [FIX BATCHNORM] rollouts toujours en eval (stats BN du SL).
+        agent.set_eval_mode()
 
         for _ in range(n_games_per_cycle):
             transitions, game_stats = _play_one_game(env, agent, gamma_t)
@@ -109,12 +111,24 @@ def worker_loop(worker_id, state, lock, transitions_queue,
                 # [NIVEAU 2] put au lieu de buffer_add.
                 # timeout : ne pas bloquer indefiniment si le trainer est
                 # mort (Queue pleine -> exception -> arret propre).
-                try:
-                    transitions_queue.put(transitions, timeout=30.0)
-                except Exception:
+                # [FIX MEMOIRE] La Queue est volontairement PETITE
+                # (backpressure) : une file momentanement pleine est normale
+                # quand le trainer est occupe. On reessaie (6 x 30 s) avant
+                # de conclure que le trainer est mort.
+                put_ok = False
+                for _attempt in range(6):
+                    try:
+                        transitions_queue.put(transitions, timeout=30.0)
+                        put_ok = True
+                        break
+                    except Exception:
+                        print(f"[worker {worker_id}] Queue pleine/indisponible "
+                              f"(essai {_attempt + 1}/6)", flush=True)
+                if not put_ok:
                     print(f"[worker {worker_id}] Queue indisponible -- "
                           f"arret du worker", flush=True)
                     return
+                transitions = None      # libere la partie des que envoyee
             # [STATS] mise a jour du proxy partage
             if game_stats is not None:
                 _update_stats(stats_proxy, lock, game_stats)
@@ -158,6 +172,12 @@ def _update_stats(stats_proxy, lock, game_stats):
             + game_stats.get('n_exhaustive', 0)
         stats_proxy['n_abortive'] = stats_proxy.get('n_abortive', 0) \
             + game_stats.get('n_abortive', 0)
+        # [STATS] riichi / appels / refus de ron / erreurs SL / requetes
+        # non gerees (doivent rester a 0 : sinon une tete SL figee est
+        # cassee).
+        for k in ('n_riichi', 'n_pon', 'n_chi', 'n_kan', 'n_ron_refused',
+                  'n_sl_errors', 'n_unhandled'):
+            stats_proxy[k] = stats_proxy.get(k, 0) + game_stats.get(k, 0)
 
 def _play_one_game(env, agent, gamma_t):
     """Joue une partie COMPLETE (4 rounds + repeats).
@@ -181,12 +201,17 @@ def _play_one_game(env, agent, gamma_t):
         'n_ron': 0,
         'n_exhaustive': 0,
         'n_abortive': 0,
+        'n_unhandled': 0,
     }
+    # [STATS] snapshot des compteurs cumules de l'env (par process) pour
+    # en deduire les deltas de CETTE partie : riichi, appels, ron refuses.
+    env_stats_before = env.get_stats()
 
     req = env.reset_round()
     while True:
         seat = req['seat']
         action = None
+        env_action = None
         logp = value = 0.0
         obs_n = obs_o = mask = None
 
@@ -196,8 +221,17 @@ def _play_one_game(env, agent, gamma_t):
             mask = req['mask']
             action, logp, value, masked_obs_o = agent.select_action(
                 obs_n, obs_o, mask, gamma_t)
+            env_action = action
+        else:
+            # [FIX] Avec les tetes SL figees, l'env ne doit yield QUE des
+            # DISCARD. Une autre requete (tete manquante / erreur SL) etait
+            # renvoyee avec action=None : pour CHOW, None != CHOW_PASS ->
+            # chow "upper" applique meme s'il est illegal. On repond par
+            # l'action sure (0 = passer / non) et on compte l'evenement.
+            stats['n_unhandled'] += 1
+            env_action = 0
 
-        result = env.step(action)
+        result = env.step(env_action)
 
         if action is not None:
             # Un siege peut ne recevoir aucune requete DISCARD dans une
@@ -207,7 +241,11 @@ def _play_one_game(env, agent, gamma_t):
             pending_reward[seat] = 0.0
             transitions.append({
                 'seat': seat,
-                'obs_normal': obs_n,
+                # [FIX MEMOIRE] float16 : ~18 Ko au lieu de ~36 Ko par coup.
+                # Les canaux sont binaires (hands >= n) ou multiples de 1/4
+                # (unseen/4) : exacts en float16. pg_is_loss reconvertit en
+                # float32 (torch.as_tensor(..., dtype=float32)).
+                'obs_normal': np.asarray(obs_n, dtype=np.float16),
                 'obs_oracle': masked_obs_o,
                 'mask': mask,
                 'action': action,
@@ -274,5 +312,19 @@ def _play_one_game(env, agent, gamma_t):
 
     stats['rank_of_seat0'] = rank_of_seat0
     stats['n_honba'] = max_honba
+
+    # [STATS] deltas env sur cette partie (compteurs cumules par process)
+    env_stats_after = env.get_stats()
+
+    def _delta(*keys):
+        return sum(int(env_stats_after.get(k, 0)) - int(env_stats_before.get(k, 0))
+                   for k in keys)
+
+    stats['n_riichi'] = _delta('riichi')
+    stats['n_pon'] = _delta('pon_calls')
+    stats['n_chi'] = _delta('chi_calls')
+    stats['n_kan'] = _delta('ankan', 'shouminkan', 'daiminkan')
+    stats['n_ron_refused'] = _delta('ron_refused')
+    stats['n_sl_errors'] = _delta('sl_errors')
 
     return transitions, stats

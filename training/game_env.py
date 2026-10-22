@@ -88,6 +88,9 @@ class GameEnv:
         self.prev_phi = [0.0] * 4
         self.is_enchousen = False
         self.end_reason = None
+        # [FIX BATONS RIICHI] batons restes sur la table apres une manche
+        # sans gagnant ; empoches par le prochain gagnant.
+        self.kyoutaku = 0
 
     def _seat_mapping(self):
         return [(self.dealer_seat + i) % 4 for i in range(4)]
@@ -103,6 +106,7 @@ class GameEnv:
             round_idx=self.round_num - 1,
             scores=[self.game_scores[mapping[i]] for i in range(4)],
             honba=self.honba,
+            kyoutaku=self.kyoutaku,
         )
         req = self.round_env.reset_round()
         return self._translate_request(req)
@@ -232,9 +236,22 @@ class GameEnv:
         # ---- Decide repeat dealer ----
         outcome = result.get('outcome', 'unknown')
         dealer_real = mapping[0]
-        dealer_round_reward = real_round_rewards[dealer_real]
+        # [FIX BATONS RIICHI] Le reward du dealer contient desormais son
+        # propre baton (-1.0 s'il a declare riichi). Les decisions de renchan
+        # / fin de partie se basent sur le gain HORS baton : sinon, a
+        # l'exhaustive avec les 4 joueurs tenpai (paiement 0), un dealer en
+        # riichi serait a -1.0 (< 0) et perdrait son renchan a tort.
+        dealer_round_reward = (real_round_rewards[dealer_real]
+                               + self.round_env.stick_paid[0])
         dealer_repeats, honba_increments = _decide_dealer_repeat(
             outcome, dealer_round_reward)
+
+        # [FIX BATONS RIICHI] report des batons : empoches par un gagnant,
+        # sinon ils restent sur la table pour la manche suivante.
+        if outcome in ("tsumo", "ron", "multi_ron"):
+            self.kyoutaku = 0
+        else:
+            self.kyoutaku = int(self.round_env.riichi_deposits)
 
         # ---- Regles de fin ----
         game_done, end_reason = self._check_game_end(
