@@ -724,6 +724,24 @@ if P is not None:
     check("parser SL : meme regle (_pov_furiten)", P._pov_furiten(st, 0))
 
 # ===================================================================== #
+# F. canal 'unseen' : defausses de TOUS les sieges
+# ===================================================================== #
+section("F. canal unseen")
+def unseen_obs(disc_seat):
+    hands = [np.zeros(34, dtype=np.int32) for _ in range(4)]
+    discards = [np.zeros(34, dtype=np.int32) for _ in range(4)]
+    discards[disc_seat][27] = 2          # deux Est defausses par ce siege
+    return build_suphx_obs(
+        hands=hands, melds=[[] for _ in range(4)], discards=discards,
+        discard_hist=[[] for _ in range(4)], riichi_flags=[False] * 4,
+        furiten_flag=False, dora_indicators=[], wall_remaining=70,
+        scores=[0] * 4, dealer_seat=0, round_wind=0, round_id=1, honba=0,
+        kyoutaku=0, seat=0, compute_lookahead_flag=False)
+for ds in range(4):
+    v = unseen_obs(ds)[_OFFSET["unseen"]][27]
+    check(f"2 Est defausses par le siege {ds} : unseen = 2/4", abs(v - 0.5) < 1e-6, v)
+
+# ===================================================================== #
 failed = [r for r in RESULTS if not r[1]]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} controles OK")
 if failed:

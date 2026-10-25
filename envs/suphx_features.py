@@ -451,7 +451,9 @@ def build_suphx_obs(*, hands, melds, discards, discard_hist,
         for m in melds[s]:
             for t in m['tiles']:
                 seen[t] += 1
-    seen += discards[s]
+        # [FIX UNSEEN] etait HORS de la boucle : seules les defausses du
+        # siege 3 etaient comptees (s valait 3 apres la boucle).
+        seen += discards[s]
     for ind in dora_indicators:
         if 0 <= ind < N_TILES:
             seen[ind] += 1
