@@ -697,6 +697,33 @@ if P is not None:
           n2m == 1, f"copies de 2m en main = {n2m} (attendu 1)")
 
 # ===================================================================== #
+# E. furiten : une tuile defaussee puis prise (chi/pon/kan) compte encore
+# ===================================================================== #
+section("E. furiten et tuiles prises par un adversaire")
+env = MultiAgentMahjongEnv(seed=7, compute_lookahead=False)
+env._deal()
+env._clear_reds()
+env.hands[0][:] = 0
+for t in (1, 2, 3, 13 + 0, 14, 15, 19, 20, 21):      # 234m 456p 234s
+    env.hands[0][t] += 1
+env.hands[0][6] = 2                                    # 77m
+env.hands[0][23] = 1; env.hands[0][24] = 1             # 67s -> attente 5s/8s
+env.melds[0] = []
+env.discards[0][:] = 0
+env._furiten_temp = [False] * 4
+check("tenpai 5s/8s, riviere vide : pas furiten", not env._is_furiten(0))
+env.river_all[0][22] += 1                              # 5s defausse...
+env.discards[0][22] += 1
+env.discards[0][22] -= 1                               # ...puis prise par un pon
+check("5s defausse puis PRISE par un adversaire : toujours furiten",
+      env._is_furiten(0))
+if P is not None:
+    st = P.GameState()
+    st.hands[0][:] = env.hands[0]
+    st.river_all[0][22] = 1                            # defausse, discards[0][22] == 0
+    check("parser SL : meme regle (_pov_furiten)", P._pov_furiten(st, 0))
+
+# ===================================================================== #
 failed = [r for r in RESULTS if not r[1]]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} controles OK")
 if failed:

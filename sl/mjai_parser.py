@@ -163,6 +163,9 @@ class GameState:
         self.hands = [np.zeros(N_TILES, dtype=np.int32) for _ in range(4)]
         self.melds = [[] for _ in range(4)]
         self.discards = [np.zeros(N_TILES, dtype=np.int32) for _ in range(4)]
+        # [FIX FURITEN] defausses completes (tuiles prises par chi/pon/kan
+        # comprises) : `discards` les retire, le furiten doit les compter.
+        self.river_all = [np.zeros(N_TILES, dtype=np.int32) for _ in range(4)]
         self.discard_history = [[] for _ in range(4)]
         self.riichi = [False, False, False, False]
         self.dora_indicators = []
@@ -230,7 +233,7 @@ def _pov_furiten(state, pov):
     except Exception:
         return False
     for t in range(N_TILES):
-        if state.discards[pov][t] > 0:
+        if state.river_all[pov][t] > 0:
             trial = counts.copy()
             trial[t] += 1
             try:
@@ -358,7 +361,7 @@ def _compute_pending_calls(state, discarder, tile):
         try:
             trial = state.get_shanten_counts(s).copy().astype(np.int32)
             trial[tile] += 1
-            if shanten_of(trial.tolist()) == -1 and state.discards[s][tile] == 0:
+            if shanten_of(trial.tolist()) == -1 and state.river_all[s][tile] == 0:
                 calls["ron"] = True
         except Exception:
             pass
@@ -496,6 +499,7 @@ def events_to_samples(events, pov=0):
             if actor is not None and tile >= 0:
                 state.hands[actor][tile] -= 1
                 state.discards[actor][tile] += 1
+                state.river_all[actor][tile] += 1
                 k_red = mjai_red_index(ev.get("pai"))
                 state.last_dahai_red = k_red
                 if k_red >= 0:

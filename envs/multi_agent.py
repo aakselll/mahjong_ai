@@ -103,6 +103,7 @@ class MultiAgentMahjongEnv:
         self.melds = None
         self.discards = None
         self.use_red = USE_RED_FIVES
+        self.river_all = [np.zeros(N_TILES, dtype=np.int32) for _ in range(4)]
         self._clear_reds()
         self._compute_lookahead = compute_lookahead
         self.wall = None
@@ -219,6 +220,10 @@ class MultiAgentMahjongEnv:
         self.melds = [[] for _ in range(4)]
         self.discards = [np.zeros(N_TILES, dtype=np.int32) for _ in range(4)]
         self._clear_reds()
+        # [FIX FURITEN] defausses COMPLETES (tuiles prises par chi/pon/kan
+        # comprises) : `discards` les retire (feature), mais le furiten
+        # permanent doit les compter.
+        self.river_all = [np.zeros(N_TILES, dtype=np.int32) for _ in range(4)]
         self.riichi = [False, False, False, False]
         # [FIX BATONS RIICHI] on repart des batons reportes (0 par defaut).
         self.riichi_deposits = int(self.ctx.get("kyoutaku", 0))
@@ -594,7 +599,7 @@ class MultiAgentMahjongEnv:
         if shanten_of(base_counts.tolist()) != 0:
             return False
         for t in range(N_TILES):
-            if self.discards[seat][t] > 0:
+            if max(self.discards[seat][t], self.river_all[seat][t]) > 0:
                 trial = base_counts.copy()
                 trial[t] += 1
                 if shanten_of(trial.tolist()) == -1:
@@ -1108,6 +1113,7 @@ class MultiAgentMahjongEnv:
                 action = tile
                 self.hands[seat][action] -= 1
                 self.discards[seat][action] += 1
+                self.river_all[seat][action] += 1
                 # [ROUGES] tsumogiri force en riichi : si la tuile piochee
                 # est le rouge, c'est lui qui part.
                 self._after_discard(seat, action, tsumogiri_red=self._drawn_red)
@@ -1128,6 +1134,7 @@ class MultiAgentMahjongEnv:
                 shanten_before = shanten_of(self._shanten_counts(seat).tolist())
                 self.hands[seat][action] -= 1
                 self.discards[seat][action] += 1
+                self.river_all[seat][action] += 1
                 self._after_discard(seat, action)
                 shanten_after = shanten_of(self._shanten_counts(seat).tolist())
                 pending = (shanten_discard_coef *

@@ -34,6 +34,7 @@ from ms import protocol_pb2 as pb
 
 from mahjong_ai.envs.suphx_features import (
     build_suphx_obs, N_CHANNELS, N_TILES as _N_TILES_SL,
+    RED_TYPES as _RED_TYPES,
 )
 from mahjong_ai.envs.multi_agent import (
     DISCARD, PONG, CHOW, KONG, RIICHI,
@@ -51,7 +52,7 @@ USE_LOOKAHEAD = os.environ.get("SL_USE_LOOKAHEAD", "1") == "1"
 
 # [pMCPA] Config via variables d'environnement
 PMCPA_ENABLE = os.environ.get("PMCPA_ENABLE", "1") == "1"
-PMCPA_K = int(os.environ.get("PMCPA_K", "10"))
+PMCPA_K = int(os.environ.get("PMCPA_K", "5"))
 PMCPA_LR = float(os.environ.get("PMCPA_LR", "1e-4"))
 PMCPA_GRAD_STEPS = int(os.environ.get("PMCPA_GRAD_STEPS", "2"))
 PMCPA_TIMEOUT = float(os.environ.get("PMCPA_TIMEOUT", "60"))
@@ -105,6 +106,28 @@ def tile_to_34(t):
         n = int(s)
         return n // 4 if n >= 34 else n
     return -1
+
+
+# [ROUGES] Mahjong Soul envoie les 5 rouges sous la forme "0m" / "0p" / "0s"
+_RED_STRS = {"0m": 0, "0p": 1, "0s": 2, "5mr": 0, "5pr": 1, "5sr": 2}
+
+
+def tile_red_index(t):
+    """0/1/2 si `t` est un 5 rouge (5m/5p/5s), sinon -1."""
+    if t is None or isinstance(t, int):
+        return -1
+    return _RED_STRS.get(str(t).strip().lower(), -1)
+
+
+def _raw_tile_of(data):
+    """Chaine brute de la tuile d'un message (pour retrouver le rouge)."""
+    for key in ("tile", "pai", "tiles"):
+        v = data.get(key)
+        if isinstance(v, list):
+            v = v[0] if v else None
+        if isinstance(v, str) and v.strip():
+            return v
+    return None
 
 
 def _extract_single_tile(data):
@@ -285,6 +308,7 @@ class GameState:
         self.furiten_riichi = False
         self._river_all = [[] for _ in range(4)]   # defausses COMPLETES
         self._ron_watch = None                     # tuile gagnante a resoudre
+        self._clear_reds()
         self.last_discarder_seat = None
         self.last_discarded_tile = None
         self.round_wind_idx = 0
@@ -308,6 +332,50 @@ class GameState:
         self._last_discarder = None
         self._has_drawn_since_call = True  # True au debut de manche
 
+
+    # ------------------------------------------------------------------ #
+    # [ROUGES] suivi des 3 rouges (0m, 0p, 0s)
+    # ------------------------------------------------------------------ #
+    def _clear_reds(self):
+        self.red_hand = np.zeros(3, dtype=bool)                 # MA main
+        self.red_river = [np.zeros(3, dtype=bool) for _ in range(4)]
+        self.red_meld = [np.zeros(3, dtype=bool) for _ in range(4)]
+        self.red_indicator = np.zeros(3, dtype=bool)
+        self.last_discard_red = -1
+
+    def _set_indicators(self, raw_list):
+        """Met a jour les indicateurs de dora (et leur eventuel rouge)."""
+        inds = []
+        for x in raw_list:
+            t = tile_to_34(x)
+            if t >= 0:
+                inds.append(t)
+            k = tile_red_index(x)
+            if k >= 0:
+                self.red_indicator[k] = True
+        if inds:
+            self.dora_indicators = inds
+
+    def _red_into_meld(self, seat, k):
+        for s in range(4):
+            self.red_river[s][k] = False
+        self.red_meld[seat][k] = True
+        if seat == self.my_seat:
+            self.red_hand[k] = False
+
+    def red_state(self):
+        hand = [np.zeros(3, dtype=bool) for _ in range(4)]
+        if self.my_seat is not None:
+            hand[self.my_seat] = self.red_hand.copy()
+        pending = -1
+        t = self.last_pending_tile
+        k = self.last_discard_red
+        if (t is not None and 0 <= k < 3 and _RED_TYPES[k] == t):
+            pending = k
+        return {'hand': hand, 'meld': [m.copy() for m in self.red_meld],
+                'river': [r.copy() for r in self.red_river],
+                'indicator': self.red_indicator.copy(),
+                'pending': pending}
 
     def update_counts(self):
         self.hand_counts = np.zeros(N_TILES, dtype=np.int32)
@@ -504,6 +572,11 @@ class GameState:
         elif action_name == "ActionLiqi":
             self._riichi(data)
 
+        # [ROUGES/DORA] un kan revele un nouvel indicateur : Mahjong Soul
+        # renvoie la liste complete dans `doras` (jamais relue avant).
+        if action_name != "ActionNewRound" and data.get("doras"):
+            self._set_indicators(data["doras"])
+
         self._update_opp_hand_sizes()
         self._force_kong_coherence()
         self.update_furiten()
@@ -566,6 +639,7 @@ class GameState:
         self.furiten_riichi = False
         self._river_all = [[] for _ in range(4)]
         self._ron_watch = None
+        self._clear_reds()
         self.last_discarder_seat = None
         self.last_discarded_tile = None
         self.wall_remaining = INITIAL_WALL_SIZE
@@ -595,10 +669,14 @@ class GameState:
         self._round_seen = True
 
         if data.get("doras"):
-            self.dora_indicators = [t for t in (tile_to_34(x) for x in data["doras"]) if t >= 0]
+            self._set_indicators(data["doras"])
         if data.get("tiles"):
             raw = data["tiles"]
             self.hand = [t for t in (tile_to_34(x) for x in raw) if t >= 0]
+            for x in raw:
+                k = tile_red_index(x)
+                if k >= 0:
+                    self.red_hand[k] = True
             self.update_counts()
             hand_display = " ".join(tile_str(t) for t in sorted(self.hand))
             _say(f"Main initiale ({len(self.hand)} tuiles) : {hand_display}")
@@ -618,6 +696,9 @@ class GameState:
             return
         self._last_draw_per_seat[seat] = idx
         if seat == self.my_seat:
+            k = tile_red_index(tile)
+            if k >= 0:
+                self.red_hand[k] = True
             self.hand.append(idx)
             self.update_counts()
             # [FIX KAN-TIMING] On vient de piocher -> kan a nouveau autorise
@@ -634,6 +715,14 @@ class GameState:
 
         tsumogiri = (self._last_draw_per_seat[seat] == idx)
         self._last_draw_per_seat[seat] = None
+
+        k_red = tile_red_index(tile)
+        self.last_discard_red = k_red
+        if k_red >= 0:
+            if seat == self.my_seat:
+                self.red_hand[k_red] = False
+            if 0 <= seat < 4:
+                self.red_river[seat][k_red] = True
 
         if seat == self.my_seat and idx in self.hand:
             self.hand.remove(idx)
@@ -703,6 +792,14 @@ class GameState:
 
         self._any_call = True
         self._last_draw_per_seat[seat] = None
+
+        # [ROUGES] le rouge de la tuile appelee (riviere -> meld) ou venant
+        # de la main (consume) entre dans le meld
+        if 0 <= seat < 4:
+            for x in raw:
+                k = tile_red_index(x)
+                if k >= 0:
+                    self._red_into_meld(seat, k)
 
         if seat == self.my_seat:
             self.melds.append({"type": meld_type, "tiles": ms})
@@ -801,6 +898,23 @@ class GameState:
              f"-> ankan={is_ankan} shouminkan={is_shouminkan}")
 
         self._any_call = True
+
+        # [ROUGES] ankan : 4 copies d'un 5 => le rouge y est ; kakan : la
+        # tuile ajoutee est rouge si le message le dit (sinon, pour moi, si
+        # ma derniere copie en main etait le rouge).
+        k_five = {t: i for i, t in enumerate(_RED_TYPES)}.get(idx, -1)
+        if 0 <= seat < 4 and k_five >= 0:
+            k_raw = tile_red_index(_raw_tile_of(data))
+            if is_ankan:
+                self._red_into_meld(seat, k_five)
+            elif is_shouminkan:
+                if k_raw == k_five:
+                    self._red_into_meld(seat, k_five)
+                elif (seat == self.my_seat and self.red_hand[k_five]
+                        and self.hand.count(idx) <= 1):
+                    self._red_into_meld(seat, k_five)
+                if k_raw == k_five or self.red_meld[seat][k_five]:
+                    self.last_discard_red = k_five
 
         if seat == self.my_seat:
             if is_ankan:
@@ -966,6 +1080,7 @@ def build_observation(state):
         normal_round_count=normal_round_count,
         # [SUPPRIME] round_progress=state.round_idx + 1,
         rounds_remaining=rounds_remaining,
+        red_state=state.red_state(),
     )
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -995,7 +1110,7 @@ def load_sl_models():
 
     try:
         from mahjong_ai.agents.suphx_cnn import (
-            build_model, IN_CHANNELS_ORACLE,
+            build_model, IN_CHANNELS_ORACLE, adapt_in_channels,
         )
 
         models = {}
@@ -1020,9 +1135,10 @@ def load_sl_models():
                     if my_state[k].shape == v.shape:
                         my_state[k].copy_(v)
                     elif k == 'trunk.input_conv.weight':
-                        new_w = torch.zeros_like(my_state[k])
-                        new_w[:, :v.shape[1]] = v
-                        my_state[k].copy_(new_w)
+                        # [ROUGES] ancien ckpt 272 canaux -> 283 : poids nuls
+                        # pour les 11 canaux rouges, oracle remis a sa place
+                        my_state[k].copy_(
+                            adapt_in_channels(v, my_state[k].shape[1]))
                 model.load_state_dict(my_state)
                 val_acc = ck.get('val_acc', None)
                 val_str = f"{val_acc:.4f}" if val_acc is not None else "RL"
@@ -1033,7 +1149,9 @@ def load_sl_models():
                     channels=cfg.get('channels', 256),
                     n_blocks=cfg.get('n_blocks', 16),
                     binary_hidden=cfg.get('binary_hidden', 256),
-                    in_channels=cfg.get('in_channels', N_CHANNELS),
+                    # [ROUGES] toujours N_CHANNELS : un ancien checkpoint a
+                    # 268 canaux est adapte au chargement (poids rouges = 0)
+                    in_channels=N_CHANNELS,
                 )
                 model.load_state_dict(ck['model_state_dict'])
                 val_acc = ck.get('val_acc', None)
