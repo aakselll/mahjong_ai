@@ -38,13 +38,18 @@ _MELD_TYPE_MAP = {
 # Layout des canaux  [MODIFIE]
 # ====================================================================== #
 
+# --- Rouges (aka dora) : un 5 rouge par famille (0m, 0p, 0s) ---------- #
+RED_TYPES = (4, 13, 22)                    # types 34 : 5m, 5p, 5s
+RED_INDEX = {t: k for k, t in enumerate(RED_TYPES)}
+N_RED = len(RED_TYPES)
+
 N_REPLACE_VALUES = (1, 2, 3, 4)
 N_SCORE_BUCKETS = 20
 LOOKAHEAD_CHANNELS = len(N_REPLACE_VALUES) * N_SCORE_BUCKETS   # 80
 MAX_DFS_RESULTS = 30
 MAX_LOOKAHEAD_SHANTEN = 2
 
-CHANNEL_GROUPS = [
+_BASE_GROUPS = [
     ('own_hand', 4),
     ('own_meld_open', 4), ('own_meld_ankan', 4),
     ('discards_s0', 4), ('discards_s1', 4), ('discards_s2', 4), ('discards_s3', 4),
@@ -65,6 +70,24 @@ CHANNEL_GROUPS = [
     ('lookahead', LOOKAHEAD_CHANNELS),
 ]
 
+# [ROUGES] Canaux ajoutes EN FIN de layout : les indices 0..N_BASE_CHANNELS-1
+# restent ceux des anciens checkpoints (les nouveaux poids d'entree sont
+# initialises a 0 au chargement, cf. agents/suphx_cnn.adapt_in_channels).
+# Chaque canal met 1.0 sur la colonne (type 34) du 5 concerne.
+_RED_GROUPS = [
+    ('red_hand', 1),          # mon 5 rouge est dans ma main
+    ('red_meld_own', 1),      # mon 5 rouge est dans un de mes melds
+    ('red_river_s0', 1), ('red_river_s1', 1),
+    ('red_river_s2', 1), ('red_river_s3', 1),   # 5 rouge dans la riviere du siege
+    ('red_meld_opp0', 1), ('red_meld_opp1', 1), ('red_meld_opp2', 1),
+    ('red_unseen', 1),        # rouge pas encore visible pour moi
+    ('pending_red', 1),       # la tuile en attente d'appel/ron est rouge
+]
+
+CHANNEL_GROUPS = _BASE_GROUPS + _RED_GROUPS
+
+N_BASE_CHANNELS = sum(n for _, n in _BASE_GROUPS)       # 268 (avant rouges)
+N_RED_CHANNELS = sum(n for _, n in _RED_GROUPS)         # 11
 N_CHANNELS = sum(n for _, n in CHANNEL_GROUPS)
 OBS_FLAT_DIM = N_CHANNELS * N_TILES
 
@@ -281,6 +304,49 @@ def _wall_bucket(wall_remaining):
 # Builder principal  [MODIFIE]
 # ====================================================================== #
 
+def empty_red_state():
+    """Etat des rouges vide (aucun 5 rouge). Tous les tableaux sont (3,) bool.
+
+    hand/meld/river : listes de 4 tableaux (un par siege).
+    indicator       : tableau (3,) -- rouge utilise comme indicateur de dora.
+    pending         : indice 0..2 du rouge si la tuile en attente est rouge, sinon -1.
+    """
+    return {
+        'hand': [np.zeros(N_RED, dtype=bool) for _ in range(4)],
+        'meld': [np.zeros(N_RED, dtype=bool) for _ in range(4)],
+        'river': [np.zeros(N_RED, dtype=bool) for _ in range(4)],
+        'indicator': np.zeros(N_RED, dtype=bool),
+        'pending': -1,
+    }
+
+
+def _fill_red_channels(C, seat, opps, red_state):
+    o_hand = _OFFSET['red_hand']
+    o_meld = _OFFSET['red_meld_own']
+    o_unseen = _OFFSET['red_unseen']
+    ind = red_state.get('indicator')
+    for k, t in enumerate(RED_TYPES):
+        if red_state['hand'][seat][k]:
+            C[o_hand][t] = 1.0
+        if red_state['meld'][seat][k]:
+            C[o_meld][t] = 1.0
+        for s in range(4):
+            if red_state['river'][s][k]:
+                C[_OFFSET[f'red_river_s{s}']][t] = 1.0
+        for i, opp in enumerate(opps):
+            if red_state['meld'][opp][k]:
+                C[_OFFSET[f'red_meld_opp{i}']][t] = 1.0
+        visible = bool(red_state['hand'][seat][k]
+                       or any(red_state['meld'][s][k] for s in range(4))
+                       or any(red_state['river'][s][k] for s in range(4))
+                       or (ind is not None and ind[k]))
+        if not visible:
+            C[o_unseen][t] = 1.0
+    pend = int(red_state.get('pending', -1))
+    if 0 <= pend < N_RED:
+        C[_OFFSET['pending_red']][RED_TYPES[pend]] = 1.0
+
+
 def build_suphx_obs(*, hands, melds, discards, discard_hist,
                     riichi_flags, furiten_flag, dora_indicators,
                     wall_remaining, scores, dealer_seat, round_wind,
@@ -289,7 +355,7 @@ def build_suphx_obs(*, hands, melds, discards, discard_hist,
                     compute_lookahead_flag=True,
                     is_last_normal_round=False, is_extension=False,
                     extension_index=0, normal_round_count=None,
-                    rounds_remaining=None):
+                    rounds_remaining=None, red_state=None):
     """
     Construit l'observation (N_CHANNELS, 34) float32.
 
@@ -300,6 +366,9 @@ def build_suphx_obs(*, hands, melds, discards, discard_hist,
     Si None, derive depuis normal_round_count et round_id.
 
     [SUPPRIME] game_format et round_progress.
+
+    red_state : dict de `empty_red_state()` (position des 3 rouges), ou None
+      = aucune info rouge (les 11 derniers canaux restent a zero).
     """
     C = np.zeros((N_CHANNELS, N_TILES), dtype=np.float32)
     def block(name):
@@ -428,6 +497,10 @@ def build_suphx_obs(*, hands, melds, discards, discard_hist,
         rounds_remaining = max(normal_round_count - round_id, 0)
     rr = min(max(int(rounds_remaining), 0), 7)
     C[block('rounds_remaining') + rr] = 1.0
+
+    # --- Rouges (canaux ajoutes en fin) ---
+    if red_state is not None:
+        _fill_red_channels(C, seat, opps, red_state)
 
     # --- Honba, kyoutaku ---
     C[block('honba') + min(int(honba), 4)] = 1.0

@@ -218,7 +218,7 @@ def main():
         channels=cfg.get('channels', 256),
         n_blocks=cfg.get('n_blocks', 16),
         binary_hidden=cfg.get('binary_hidden', 256),
-        in_channels=cfg.get('in_channels', N_CHANNELS),
+        in_channels=N_CHANNELS,   # [ROUGES] ancien ckpt adapte au chargement
     ).to(device)
     model.load_state_dict(ckpt['model_state_dict'])
     model.eval()

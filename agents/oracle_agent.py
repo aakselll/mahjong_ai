@@ -16,6 +16,7 @@ import torch.nn as nn
 import os
 from mahjong_ai.agents.suphx_cnn import (
     build_model, N_CHANNELS, ORACLE_DIM, IN_CHANNELS_ORACLE,
+    adapt_in_channels, adapt_flat_in_features,
 )
 
 
@@ -29,6 +30,14 @@ class Critic(nn.Module):
             nn.Linear(hidden, hidden // 2), nn.ReLU(),
             nn.Linear(hidden // 2, 1),
         )
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        # [ROUGES] ancien critic (272 canaux) -> nouveau (283)
+        key = prefix + 'net.1.weight'
+        w = state_dict.get(key)
+        if w is not None and w.shape[1] != self.net[1].in_features:
+            state_dict[key] = adapt_flat_in_features(w, self.net[1].in_features)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
     def forward(self, x):
         return self.net(x).squeeze(-1)
 
@@ -90,7 +99,10 @@ class OracleDiscardAgent:
                     channels=hcfg.get('channels', 256),
                     n_blocks=hcfg.get('n_blocks', 16),
                     binary_hidden=hcfg.get('binary_hidden', 256),
-                    in_channels=hcfg.get('in_channels', N_CHANNELS),
+                    # [ROUGES] toujours N_CHANNELS : un ancien checkpoint a
+                    # 268 canaux est charge avec des poids nuls pour les
+                    # 11 canaux rouges (comportement inchange).
+                    in_channels=N_CHANNELS,
                 ).to(device)
                 m.load_state_dict(hck['model_state_dict'])
                 m.eval()
@@ -138,9 +150,9 @@ class OracleDiscardAgent:
             if my_state[k].shape == v.shape:
                 my_state[k].copy_(v)
             elif k == 'trunk.input_conv.weight':
-                # (256, 386, 3, 1) attendu, on a (256, 250, 3, 1)
-                new_w = torch.zeros_like(my_state[k])
-                new_w[:, :v.shape[1]] = v
+                # [ROUGES] (256, 283, 3, 1) attendu ; le SL a 268 (ancien)
+                # ou 279 (avec rouges) canaux : blocs absents = zeros.
+                new_w = adapt_in_channels(v, my_state[k].shape[1])
                 my_state[k].copy_(new_w)
                 print(f"[oracle_agent] {k} etendu de {v.shape} a {new_w.shape}")
             # Les autres mismatch sont ignores (rare)

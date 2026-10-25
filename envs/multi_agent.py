@@ -17,9 +17,13 @@ from mahjong.hand_calculating.hand import HandCalculator
 from mahjong.hand_calculating.hand_config import HandConfig, OptionalRules
 from mahjong.meld import Meld
 
-from mahjong_ai.envs.suphx_features import build_suphx_obs, N_CHANNELS
+from mahjong_ai.envs.suphx_features import (
+    build_suphx_obs, N_CHANNELS, RED_TYPES, RED_INDEX, N_RED)
 from mahjong_ai.envs.tiles import shanten_of, N_TILES, COPIES_PER_TILE, HAND_SIZE
-from mahjong_ai.envs.suphx_features import build_suphx_obs, N_CHANNELS
+
+# [ROUGES] 3 rouges (un 5 par famille : 0m, 0p, 0s), comme Mahjong Soul /
+# Tenhou. MJ_RED_FIVES=0 pour retrouver l'ancien env sans rouges.
+USE_RED_FIVES = os.environ.get("MJ_RED_FIVES", "1") != "0"
 
 DEAD_WALL_SIZE = 14
 RINSHAN_POOL_SIZE = 4
@@ -98,6 +102,8 @@ class MultiAgentMahjongEnv:
         self.hands = None
         self.melds = None
         self.discards = None
+        self.use_red = USE_RED_FIVES
+        self._clear_reds()
         self._compute_lookahead = compute_lookahead
         self.wall = None
         self.rinshan_pool = None
@@ -202,11 +208,17 @@ class MultiAgentMahjongEnv:
         full_wall = []
         for tile in range(N_TILES):
             full_wall.extend([tile] * COPIES_PER_TILE)
+        if self.use_red:
+            # [ROUGES] une copie de chaque 5 devient un sentinel N_TILES+k
+            # (34, 35, 36) ; decode par _type_of / _to_hand a la pioche.
+            for k, t in enumerate(RED_TYPES):
+                full_wall[full_wall.index(t)] = N_TILES + k
         self.rng.shuffle(full_wall)
 
         self.hands = [np.zeros(N_TILES, dtype=np.int32) for _ in range(4)]
         self.melds = [[] for _ in range(4)]
         self.discards = [np.zeros(N_TILES, dtype=np.int32) for _ in range(4)]
+        self._clear_reds()
         self.riichi = [False, False, False, False]
         # [FIX BATONS RIICHI] on repart des batons reportes (0 par defaut).
         self.riichi_deposits = int(self.ctx.get("kyoutaku", 0))
@@ -228,7 +240,7 @@ class MultiAgentMahjongEnv:
         idx = 0
         for seat in range(4):
             for tile in full_wall[idx:idx + HAND_SIZE]:
-                self.hands[seat][tile] += 1
+                self._to_hand(seat, tile)
             idx += HAND_SIZE
 
         dead_wall = full_wall[len(full_wall) - DEAD_WALL_SIZE:]
@@ -240,17 +252,117 @@ class MultiAgentMahjongEnv:
         dora_pairs = dead_wall[RINSHAN_POOL_SIZE:]
         self._dora_pairs = [(dora_pairs[2 * i], dora_pairs[2 * i + 1])
                              for i in range(N_DORA_PAIRS)]
-        self.dora_indicators = [self._dora_pairs[0][0]]
-        self.ura_dora_indicators = [self._dora_pairs[0][1]]
+        self.dora_indicators = [self._reveal_indicator(self._dora_pairs[0][0])]
+        self.ura_dora_indicators = [self._type_of(self._dora_pairs[0][1])]
         self._next_dora_pair_idx = 1
+
+    # ------------------------------------------------------------------ #
+    # [ROUGES] Suivi des 3 rouges (un 5 rouge par famille)
+    # ------------------------------------------------------------------ #
+    # Les tuiles restent comptees par TYPE (34). Pour chaque rouge k (0=5m,
+    # 1=5p, 2=5s) on suit seulement OU il est :
+    #   red_hand[seat][k]  : dans la main du siege (implique hands[t] >= 1)
+    #   red_river[seat][k] : dans la riviere du siege (pas encore appele)
+    #   melds[seat][i]["reds"] : liste des k dont le rouge est dans le meld
+    # Regle de defausse (l'action est un TYPE) : on garde le rouge, on
+    # defausse la copie normale d'abord ; le rouge part quand c'est la
+    # derniere copie de la main (ou un tsumogiri force en riichi).
+    def _clear_reds(self):
+        self.red_hand = [np.zeros(N_RED, dtype=bool) for _ in range(4)]
+        self.red_river = [np.zeros(N_RED, dtype=bool) for _ in range(4)]
+        self.red_indicator = np.zeros(N_RED, dtype=bool)
+        self._last_discard_red = -1     # k si la derniere tuile defaussee / kakan est rouge
+        self._drawn_red = -1            # k si la tuile qu'on vient de piocher est rouge
+
+    @staticmethod
+    def _type_of(raw):
+        return int(raw) if raw < N_TILES else RED_TYPES[int(raw) - N_TILES]
+
+    def _reveal_indicator(self, raw):
+        if raw >= N_TILES:
+            self.red_indicator[int(raw) - N_TILES] = True
+        return self._type_of(raw)
+
+    def _to_hand(self, seat, raw):
+        """Ajoute une tuile (type ou sentinel rouge) a la main ; retourne son type."""
+        t = self._type_of(raw)
+        self.hands[seat][t] += 1
+        self._drawn_red = -1
+        if raw >= N_TILES:
+            self.red_hand[seat][int(raw) - N_TILES] = True
+            self._drawn_red = int(raw) - N_TILES
+        return t
+
+    def _after_discard(self, seat, t, tsumogiri_red=-1):
+        """A appeler APRES hands[seat][t] -= 1 : decide si la tuile defaussee est le rouge."""
+        k = RED_INDEX.get(t, -1)
+        out = -1
+        if k >= 0 and self.red_hand[seat][k] and (
+                self.hands[seat][t] == 0 or tsumogiri_red == k):
+            self.red_hand[seat][k] = False
+            self.red_river[seat][k] = True
+            out = k
+        self._last_discard_red = out
+
+    def _claim_reds(self, seat, called_type, removed_types):
+        """A appeler APRES le retrait des tuiles de la main pour un meld.
+        Retourne la liste des rouges qui entrent dans le meld (tuile appelee
+        + rouges de la main dont la derniere copie vient de partir)."""
+        reds = []
+        if called_type is not None:
+            k = RED_INDEX.get(called_type, -1)
+            if k >= 0 and self._last_discard_red == k:
+                d = self._last_discarder
+                if d is not None:
+                    self.red_river[d][k] = False
+                reds.append(k)
+                self._last_discard_red = -1
+        for t in set(removed_types):
+            kk = RED_INDEX.get(t, -1)
+            if kk >= 0 and self.red_hand[seat][kk] and self.hands[seat][t] == 0:
+                self.red_hand[seat][kk] = False
+                reds.append(kk)
+        return reds
+
+    def _seat_reds(self, seat):
+        """Rouges possedes par le siege (main + melds), tableau bool (3,)."""
+        out = np.zeros(N_RED, dtype=bool)
+        for k in range(N_RED):
+            if self.red_hand[seat][k] and self.hands[seat][RED_TYPES[k]] > 0:
+                out[k] = True
+        for m in self.melds[seat]:
+            for k in m.get("reds", ()):
+                out[k] = True
+        return out
+
+    def _red_state(self, seat, pending_claim_tile=None):
+        hand = [np.array([bool(self.red_hand[s][k]
+                               and self.hands[s][RED_TYPES[k]] > 0)
+                          for k in range(N_RED)]) for s in range(4)]
+        meld = []
+        for s in range(4):
+            a = np.zeros(N_RED, dtype=bool)
+            for m in self.melds[s]:
+                for k in m.get("reds", ()):
+                    a[k] = True
+            meld.append(a)
+        pending = -1
+        if pending_claim_tile is not None:
+            k = RED_INDEX.get(int(pending_claim_tile), -1)
+            if k >= 0 and self._last_discard_red == k:
+                pending = k
+        return {'hand': hand, 'meld': meld,
+                'river': [r.copy() for r in self.red_river],
+                'indicator': self.red_indicator.copy(),
+                'pending': pending}
 
         self._stats["rounds"] += 1
 
     def _reveal_kan_dora(self):
         if self._next_dora_pair_idx < N_DORA_PAIRS:
             ind, ura = self._dora_pairs[self._next_dora_pair_idx]
-            self.dora_indicators.append(ind)
-            self.ura_dora_indicators.append(ura)
+            self.dora_indicators.append(self._reveal_indicator(ind))
+            self.ura_dora_indicators.append(self._type_of(ura))
             self._next_dora_pair_idx += 1
 
     def _should_declare_ron(self, seat, win_result):
@@ -387,11 +499,24 @@ class MultiAgentMahjongEnv:
         return False
 
     def _build_136_representation(self, seat):
-        next_id = [0] * N_TILES
+        # [ROUGES] ids 136 : le rouge d'un 5 a l'id 4*t (16 / 52 / 88 =
+        # AKA_DORA_LIST de la lib). Sans rouge on demarre a 4*t+1, sinon
+        # tout 5 compterait comme aka. Les ids d'un type restent contigus.
+        next_id = [4 * t for t in range(N_TILES)]
+        if self.use_red:
+            reds = self._seat_reds(seat)
+            total = self._full_counts(seat)
+            for k, t in enumerate(RED_TYPES):
+                # 4 copies d'un 5 => le rouge y est forcement (evite de
+                # deborder sur l'id du type suivant si l'etat est injecte)
+                if not reds[k] and total[t] < 4:
+                    next_id[t] += 1
+        used = []
 
         def take_id(t):
-            tid = 4 * t + next_id[t]
+            tid = next_id[t]
             next_id[t] += 1
+            used.append(tid)
             return tid
 
         meld_objs = []
@@ -400,25 +525,30 @@ class MultiAgentMahjongEnv:
             opened = m["type"] != "kan_closed"
             meld_objs.append(Meld(meld_type=_MELD_TYPE_MAP[m["type"]],
                                    tiles=ids, opened=opened))
-        tiles_136 = []
         for t in range(N_TILES):
-            for tid in range(next_id[t]):
-                tiles_136.append(4 * t + tid)
             for _ in range(int(self.hands[seat][t])):
-                tiles_136.append(take_id(t))
-        return tiles_136, meld_objs
+                take_id(t)
+        tiles_136 = sorted(used)
+        last_id = [x - 1 for x in next_id]       # dernier id attribue par type
+        return tiles_136, meld_objs, last_id
 
     def _evaluate_hand(self, seat, win_tile_type, is_tsumo, already_in_hand,
                         is_rinshan=False, is_chankan=False,
                         is_haitei=False, is_houtei=False):
+        win_red_k = RED_INDEX.get(win_tile_type, -1)
+        win_red_added = (not already_in_hand and self.use_red and win_red_k >= 0
+                         and self._last_discard_red == win_red_k
+                         and not self.red_hand[seat][win_red_k])
         if not already_in_hand:
             self.hands[seat][win_tile_type] += 1
+            if win_red_added:
+                # [ROUGES] la tuile du ron / chankan est le rouge : il compte
+                self.red_hand[seat][win_red_k] = True
         try:
             if shanten_of(self._shanten_counts(seat).tolist()) != -1:
                 return None
-            tiles_136, melds_136 = self._build_136_representation(seat)
-            count_of_type = int(self._full_counts(seat)[win_tile_type])
-            win_tile_136 = 4 * win_tile_type + (count_of_type - 1)
+            tiles_136, melds_136, last_id = self._build_136_representation(seat)
+            win_tile_136 = last_id[win_tile_type]
             dora_ind_136 = [t * 4 for t in self.dora_indicators]
             ura_ind_136 = ([t * 4 for t in self.ura_dora_indicators]
                             if self.riichi[seat] else None)
@@ -435,7 +565,8 @@ class MultiAgentMahjongEnv:
                 player_wind=SEAT_WINDS[seat],
                 round_wind=SEAT_WINDS[min(self.ctx["round_wind_idx"], 3)],
                 kyoutaku_number=self.riichi_deposits,
-                options=OptionalRules(has_open_tanyao=True, has_aka_dora=False,
+                options=OptionalRules(has_open_tanyao=True,
+                                      has_aka_dora=self.use_red,
                                       has_double_yakuman=True),
             )
             result = HandCalculator.estimate_hand_value(
@@ -447,6 +578,8 @@ class MultiAgentMahjongEnv:
         finally:
             if not already_in_hand:
                 self.hands[seat][win_tile_type] -= 1
+                if win_red_added:
+                    self.red_hand[seat][win_red_k] = False
 
     def _can_declare_win(self, seat, win_tile_type, is_tsumo, already_in_hand, **flags):
         return self._evaluate_hand(seat, win_tile_type, is_tsumo,
@@ -498,7 +631,9 @@ class MultiAgentMahjongEnv:
 
     def _apply_pong(self, seat, tile):
         self.hands[seat][tile] -= 2
-        self.melds[seat].append({"type": "pon", "tiles": [tile, tile, tile]})
+        reds = self._claim_reds(seat, tile, [tile])
+        self.melds[seat].append({"type": "pon", "tiles": [tile, tile, tile],
+                                 "reds": reds})
         self._stats["pon_calls"] += 1
         self._any_call = True
         self._ippatsu = [False] * 4
@@ -513,7 +648,10 @@ class MultiAgentMahjongEnv:
             used = (tile + 1, tile + 2)
         for t in used:
             self.hands[seat][t] -= 1
-        self.melds[seat].append({"type": "chi", "tiles": sorted([tile, used[0], used[1]])})
+        reds = self._claim_reds(seat, tile, list(used))
+        self.melds[seat].append({"type": "chi",
+                                 "tiles": sorted([tile, used[0], used[1]]),
+                                 "reds": reds})
         self._stats["chi_calls"] += 1
         self._any_call = True
         self._ippatsu = [False] * 4
@@ -521,7 +659,9 @@ class MultiAgentMahjongEnv:
 
     def _apply_daiminkan(self, seat, tile):
         self.hands[seat][tile] -= 3
-        self.melds[seat].append({"type": "kan_open", "tiles": [tile] * 4})
+        reds = self._claim_reds(seat, tile, [tile])
+        self.melds[seat].append({"type": "kan_open", "tiles": [tile] * 4,
+                                 "reds": reds})
         self._any_call = True
         self._ippatsu = [False] * 4
 
@@ -541,7 +681,9 @@ class MultiAgentMahjongEnv:
 
     def _apply_closed_kong(self, seat, tile):
         self.hands[seat][tile] -= 4
-        self.melds[seat].append({"type": "kan_closed", "tiles": [tile] * 4})
+        reds = self._claim_reds(seat, None, [tile])
+        self.melds[seat].append({"type": "kan_closed", "tiles": [tile] * 4,
+                                 "reds": reds})
         self._any_call = True
         self._ippatsu = [False] * 4
         self._reveal_kan_dora()
@@ -549,10 +691,14 @@ class MultiAgentMahjongEnv:
 
     def _apply_shouminkan(self, seat, tile):
         self.hands[seat][tile] -= 1
+        added = self._claim_reds(seat, None, [tile])
+        # la tuile ajoutee est celle qu'un adversaire peut chankan
+        self._last_discard_red = added[0] if added else -1
         for m in self.melds[seat]:
             if m["type"] == "pon" and m["tiles"][0] == tile:
                 m["type"] = "shouminkan"
                 m["tiles"].append(tile)
+                m.setdefault("reds", []).extend(added)
                 break
         self._any_call = True
         self._ippatsu = [False] * 4
@@ -644,6 +790,8 @@ class MultiAgentMahjongEnv:
             normal_round_count=normal_round_count,
             # [SUPPRIME] round_progress=round_index + 1,
             rounds_remaining=rounds_remaining,
+            red_state=(self._red_state(seat, pending_claim_tile)
+                       if self.use_red else None),
         )
         self._pending_oracle = self._build_oracle(seat)
         return obs
@@ -775,9 +923,8 @@ class MultiAgentMahjongEnv:
 
             if not just_called:
                 if replacement_tile is not None:
-                    tile = replacement_tile
+                    tile = self._to_hand(seat, replacement_tile)
                     replacement_tile = None
-                    self.hands[seat][tile] += 1
                     is_rinshan = True
                 else:
                     if not self.wall:
@@ -785,8 +932,7 @@ class MultiAgentMahjongEnv:
                         final_rewards = self._noten_payment_rewards()
                         return self._final(pending[0], pending[1], final_rewards,
                                             "exhaustive")
-                    tile = self.wall.pop()
-                    self.hands[seat][tile] += 1
+                    tile = self._to_hand(seat, self.wall.pop())
                     is_rinshan = False
 
                 drawn_tile = tile
@@ -962,6 +1108,9 @@ class MultiAgentMahjongEnv:
                 action = tile
                 self.hands[seat][action] -= 1
                 self.discards[seat][action] += 1
+                # [ROUGES] tsumogiri force en riichi : si la tuile piochee
+                # est le rouge, c'est lui qui part.
+                self._after_discard(seat, action, tsumogiri_red=self._drawn_red)
                 discarded_tile, discarder = action, seat
             else:
                 mask_d = (forced_discard_mask if forced_discard_mask is not None
@@ -979,6 +1128,7 @@ class MultiAgentMahjongEnv:
                 shanten_before = shanten_of(self._shanten_counts(seat).tolist())
                 self.hands[seat][action] -= 1
                 self.discards[seat][action] += 1
+                self._after_discard(seat, action)
                 shanten_after = shanten_of(self._shanten_counts(seat).tolist())
                 pending = (shanten_discard_coef *
                             float(shanten_before - shanten_after) - STEP_PENALTY, seat)

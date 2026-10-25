@@ -15,7 +15,7 @@ import os
 import numpy as np
 import zstandard as zstd
 from mahjong_ai.envs.tiles import shanten_of, N_TILES, HAND_SIZE
-from mahjong_ai.envs.suphx_features import build_suphx_obs, N_CHANNELS
+from mahjong_ai.envs.suphx_features import build_suphx_obs, N_CHANNELS, N_RED
 from mahjong_ai.envs.multi_agent import (
     DISCARD, PONG, CHOW, KONG, RIICHI, RON,
     CHOW_PASS, CHOW_LOWER, CHOW_MID, CHOW_UPPER,
@@ -38,6 +38,15 @@ for red, normal in [("0m", "5m"), ("0p", "5p"), ("0s", "5s"),
                      ("5mr", "5m"), ("5pr", "5p"), ("5sr", "5s")]:
     if normal in _TILE_MAP:
         _TILE_MAP[red] = _TILE_MAP[normal]
+
+# [ROUGES] 5 rouges : "5mr"/"5pr"/"5sr" (mjai) ou "0m"/"0p"/"0s" -> 0, 1, 2
+_RED_STR = {"5mr": 0, "0m": 0, "5pr": 1, "0p": 1, "5sr": 2, "0s": 2}
+
+
+def mjai_red_index(tile_str):
+    """Indice du rouge (0=5m, 1=5p, 2=5s) si la tuile est un 5 rouge, sinon -1."""
+    return _RED_STR.get(tile_str, -1)
+
 
 def mjai_tile_to_34(tile_str):
     if tile_str is None or tile_str == "?":
@@ -162,6 +171,24 @@ class GameState:
         self.pending_tile = None
         self.last_discarder = None
         self._feature_context = None
+        # [ROUGES] position des 3 rouges (voir envs/suphx_features.empty_red_state)
+        self.red_hand = [np.zeros(N_RED, dtype=bool) for _ in range(4)]
+        self.red_river = [np.zeros(N_RED, dtype=bool) for _ in range(4)]
+        self.red_indicator = np.zeros(N_RED, dtype=bool)
+        self.last_dahai_red = -1       # rouge de la derniere defausse (si pending_tile)
+
+    def red_state(self):
+        meld = []
+        for s in range(4):
+            a = np.zeros(N_RED, dtype=bool)
+            for m in self.melds[s]:
+                for k in m.get("reds", ()):
+                    a[k] = True
+            meld.append(a)
+        return {'hand': self.red_hand, 'meld': meld, 'river': self.red_river,
+                'indicator': self.red_indicator,
+                'pending': (self.last_dahai_red
+                            if self.pending_tile is not None else -1)}
 
     def get_hand_counts(self, seat):
         return self.hands[seat].copy()
@@ -251,6 +278,7 @@ def build_obs(state, pov):
         is_extension=context["is_extension"],
         extension_index=context["extension_index"],
         rounds_remaining=context["rounds_remaining"],
+        red_state=state.red_state(),
     )
 
 # ====================================================================== #
@@ -409,9 +437,15 @@ def events_to_samples(events, pov=0):
             for s in range(4):
                 if s < len(tehais):
                     state.hands[s] = mjai_tiles_to_counts(tehais[s])
+                    for t_str in tehais[s]:
+                        k = mjai_red_index(t_str)
+                        if k >= 0:
+                            state.red_hand[s][k] = True
             dora = ev.get("dora_marker")
             if dora:
                 state.dora_indicators = [mjai_tile_to_34(dora)]
+                if mjai_red_index(dora) >= 0:
+                    state.red_indicator[mjai_red_index(dora)] = True
             state.wall_remaining = 70
             state._feature_context = _compute_round_context(
                 ev, normal_round_count)
@@ -428,6 +462,8 @@ def events_to_samples(events, pov=0):
                 state.pending_tile = None
             if actor is not None and tile >= 0:
                 state.hands[actor][tile] += 1
+                if mjai_red_index(ev.get("pai")) >= 0:
+                    state.red_hand[actor][mjai_red_index(ev.get("pai"))] = True
                 state.last_draw[actor] = tile
                 state.wall_remaining = max(0, state.wall_remaining - 1)
                 if actor == pov and not state.riichi[pov]:
@@ -460,6 +496,11 @@ def events_to_samples(events, pov=0):
             if actor is not None and tile >= 0:
                 state.hands[actor][tile] -= 1
                 state.discards[actor][tile] += 1
+                k_red = mjai_red_index(ev.get("pai"))
+                state.last_dahai_red = k_red
+                if k_red >= 0:
+                    state.red_hand[actor][k_red] = False
+                    state.red_river[actor][k_red] = True
                 state.discard_history[actor].append((tile, bool(tsumogiri)))
                 state.last_discarder = actor
                 state.pending_tile = tile
@@ -479,34 +520,64 @@ def events_to_samples(events, pov=0):
             pending_calls = {}
             state.pending_tile = None
             called = mjai_tile_to_34(ev.get("pai"))
+            called_red = mjai_red_index(ev.get("pai"))
+            from_discard = (ev_type in ("chi", "pon", "daiminkan")
+                            and called >= 0 and state.last_discarder is not None
+                            and state.last_discarder != actor)
             if (called >= 0 and state.last_discarder is not None
                     and state.last_discarder != actor):
                 state.discards[state.last_discarder][called] -= 1
                 if state.discards[state.last_discarder][called] < 0:
                     state.discards[state.last_discarder][called] = 0
             if actor is not None:
-                consumed = [mjai_tile_to_34(t) for t in ev.get("consumed", [])]
-                for t in consumed:
-                    if t >= 0:
-                        state.hands[actor][t] -= 1
+                consumed_raw = list(ev.get("consumed", []))
+                consumed = [mjai_tile_to_34(t) for t in consumed_raw]
+                # [ROUGES] rouges qui entrent dans le meld
+                meld_reds = []
+                if from_discard and called_red >= 0:
+                    state.red_river[state.last_discarder][called_red] = False
+                    meld_reds.append(called_red)
+                if ev_type == "kakan":
+                    # [FIX KAKAN] en mjai, `consumed` = les 3 tuiles du pon
+                    # DEJA expose et `pai` = la tuile ajoutee depuis la main.
+                    # L'ancien code retirait 3 tuiles de la main au lieu
+                    # d'une (compteurs negatifs, tuile ajoutee jamais retiree).
+                    if called >= 0:
+                        state.hands[actor][called] -= 1
+                    if called_red >= 0:
+                        state.red_hand[actor][called_red] = False
+                        meld_reds.append(called_red)
+                else:
+                    for t_str, t in zip(consumed_raw, consumed):
+                        if t >= 0:
+                            state.hands[actor][t] -= 1
+                        k = mjai_red_index(t_str)
+                        if k >= 0:
+                            state.red_hand[actor][k] = False
+                            meld_reds.append(k)
                 if ev_type == "chi" and called >= 0:
                     state.melds[actor].append(
-                        {"type": "chi", "tiles": sorted(consumed + [called])})
+                        {"type": "chi", "tiles": sorted(consumed + [called]),
+                         "reds": meld_reds})
                 elif ev_type == "pon" and called >= 0:
                     state.melds[actor].append(
-                        {"type": "pon", "tiles": [called] * 3})
+                        {"type": "pon", "tiles": [called] * 3,
+                         "reds": meld_reds})
                 elif ev_type == "daiminkan" and called >= 0:
                     state.melds[actor].append(
-                        {"type": "kan_open", "tiles": [called] * 4})
+                        {"type": "kan_open", "tiles": [called] * 4,
+                         "reds": meld_reds})
                 elif ev_type == "kakan" and called >= 0:
                     for m in state.melds[actor]:
                         if m["type"] == "pon" and m["tiles"][0] == called:
                             m["type"] = "shouminkan"
                             m["tiles"].append(called)
+                            m.setdefault("reds", []).extend(meld_reds)
                             break
                 elif ev_type == "ankan" and consumed:
                     state.melds[actor].append(
-                        {"type": "kan_closed", "tiles": [consumed[0]] * 4})
+                        {"type": "kan_closed", "tiles": [consumed[0]] * 4,
+                         "reds": meld_reds})
             continue
 
         if ev_type == "reach":
@@ -532,6 +603,8 @@ def events_to_samples(events, pov=0):
                 idx = mjai_tile_to_34(dora)
                 if idx >= 0:
                     state.dora_indicators.append(idx)
+                    if mjai_red_index(dora) >= 0:
+                        state.red_indicator[mjai_red_index(dora)] = True
             continue
 
         if ev_type == "hora":

@@ -47,6 +47,7 @@ def make_env(hands, melds=None, wall_tail=None, wall_full=None, seed=11):
             for t in hands[s]:
                 h[t] += 1
             env.hands[s] = h
+        env._clear_reds()      # [ROUGES] mains injectees : pas de rouge
         if melds:
             for s in range(4):
                 env.melds[s] = list(melds[s])

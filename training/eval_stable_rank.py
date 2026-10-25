@@ -49,7 +49,7 @@ def load_sl_weak(weak_dir, device='cpu'):
             channels=cfg.get('channels', 256),
             n_blocks=cfg.get('n_blocks', 16),
             binary_hidden=cfg.get('binary_hidden', 256),
-            in_channels=cfg.get('in_channels', N_CHANNELS),
+            in_channels=N_CHANNELS,   # [ROUGES] ancien ckpt adapte au chargement
         ).to(device)
         m.load_state_dict(ck['model_state_dict'])
         m.eval()

@@ -399,6 +399,9 @@ class PMCPA:
             env.hands[1] = sampled['hands'][1].copy()
             env.hands[2] = sampled['hands'][2].copy()
             env.hands[3] = sampled['hands'][3].copy()
+            # [ROUGES] les mains echantillonnees n'ont pas de rouge
+            if hasattr(env, '_clear_reds'):
+                env._clear_reds()
             env.wall = list(sampled['wall'])
             env.rinshan_pool = list(sampled['dead_wall'][:RINSHAN_SIZE])
             env.dora_indicators = list(sampled['dora_indicators'])

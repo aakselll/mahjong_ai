@@ -34,6 +34,14 @@ class Critic(nn.Module):
             nn.Linear(hidden // 2, 1),
         )
 
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        key = prefix + 'net.1.weight'
+        w = state_dict.get(key)
+        if w is not None and w.shape[1] != self.net[1].in_features:
+            from mahjong_ai.agents.suphx_cnn import adapt_flat_in_features
+            state_dict[key] = adapt_flat_in_features(w, self.net[1].in_features)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
     def forward(self, x):
         return self.net(x).squeeze(-1)
 

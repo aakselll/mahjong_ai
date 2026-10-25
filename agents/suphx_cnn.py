@@ -17,12 +17,61 @@ Référence : Suphx paper §2.2, Fig. 4-5.
 import torch
 import torch.nn as nn
 
-from mahjong_ai.envs.suphx_features import N_CHANNELS
+from mahjong_ai.envs.suphx_features import (
+    N_CHANNELS, N_BASE_CHANNELS, N_RED_CHANNELS)
 
 # Dimensions oracle : 3 mains adverses (3*34=102) + mur caché (34) = 136
 # 4 canaux oracle : 3 mains adverses + 1 mur cache
 ORACLE_DIM = 4
-IN_CHANNELS_ORACLE = N_CHANNELS + ORACLE_DIM   # 254
+IN_CHANNELS_ORACLE = N_CHANNELS + ORACLE_DIM   # 283 (268 base + 11 rouges + 4 oracle)
+
+
+def adapt_in_channels(w, target_in, dim=1):
+    """Remet l'axe des canaux d'entree de `w` au layout de `target_in`.
+
+    Layouts reconnus (ordre des blocs : base | rouges | oracle) :
+        268 = base                 279 = base + rouges
+        272 = base + oracle        283 = base + rouges + oracle
+    Un bloc absent de la source est rempli de ZEROS (le modele se comporte
+    alors exactement comme avant) ; un bloc absent de la cible est retire.
+    Une forme non reconnue est rendue telle quelle (le chargement echouera
+    avec le message PyTorch habituel).
+    """
+    cur = w.shape[dim]
+    if cur == target_in:
+        return w
+    sizes = (N_BASE_CHANNELS, N_RED_CHANNELS, ORACLE_DIM)
+    layouts = {
+        N_BASE_CHANNELS: (True, False, False),
+        N_BASE_CHANNELS + ORACLE_DIM: (True, False, True),
+        N_BASE_CHANNELS + N_RED_CHANNELS: (True, True, False),
+        N_BASE_CHANNELS + N_RED_CHANNELS + ORACLE_DIM: (True, True, True),
+    }
+    if cur not in layouts or target_in not in layouts:
+        return w
+    pieces, pos = [], 0
+    for size, has_src, has_dst in zip(sizes, layouts[cur], layouts[target_in]):
+        piece = None
+        if has_src:
+            piece = w.narrow(dim, pos, size)
+            pos += size
+        if has_dst:
+            if piece is None:
+                shape = list(w.shape)
+                shape[dim] = size
+                piece = w.new_zeros(shape)
+            pieces.append(piece)
+    return torch.cat(pieces, dim=dim).contiguous()
+
+
+def adapt_flat_in_features(w, target_in_features, n_tiles=34):
+    """Idem pour un Linear qui aplatit (C, 34) : w est (out, C*34)."""
+    if w.shape[1] == target_in_features or w.shape[1] % n_tiles:
+        return w
+    out = w.shape[0]
+    w3 = w.reshape(out, w.shape[1] // n_tiles, n_tiles)
+    w3 = adapt_in_channels(w3, target_in_features // n_tiles, dim=1)
+    return w3.reshape(out, -1).contiguous()
 
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
@@ -48,6 +97,15 @@ class SuphxTrunk(nn.Module):
         self.bn_in = nn.BatchNorm2d(channels)
         self.blocks = nn.ModuleList([ResidualBlock(channels) for _ in range(n_blocks)])
         self.relu = nn.ReLU(inplace=True)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        # [ROUGES] Les checkpoints d'avant les canaux rouges ont 268/272
+        # canaux d'entree : on insere des poids nuls pour les nouveaux.
+        key = prefix + 'input_conv.weight'
+        w = state_dict.get(key)
+        if w is not None and w.shape[1] != self.input_conv.in_channels:
+            state_dict[key] = adapt_in_channels(w, self.input_conv.in_channels)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def forward(self, x):
         x = self.relu(self.bn_in(self.input_conv(x)))
@@ -110,8 +168,8 @@ def build_model(head_type, use_oracle=False, **kwargs):
 
     Args:
         head_type  : 'discard' / 'riichi' / 'chow' / 'pong' / 'kong'
-        use_oracle : si True, force in_channels=IN_CHANNELS_ORACLE (386).
-                     Sinon, utilise in_channels du kwargs (defaut N_CHANNELS=250).
+        use_oracle : si True, force in_channels=IN_CHANNELS_ORACLE (283).
+                     Sinon, utilise in_channels du kwargs (defaut N_CHANNELS=279).
     """
     if use_oracle:
         kwargs.setdefault('in_channels', IN_CHANNELS_ORACLE)
