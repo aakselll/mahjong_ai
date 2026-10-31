@@ -60,9 +60,12 @@ def load_sl_weak(weak_dir, device='cpu'):
 
 
 class SLWeakAgent:
-    def __init__(self, weak_dir, device='cpu'):
+    def __init__(self, weak_dir, device='cpu', sample=False):
         self.models = load_sl_weak(weak_dir, device)
         self.device = device
+        # [DIAG] True : les adversaires SL echantillonnent (comme a
+        # l'entrainement --opponent-mode sample) au lieu de l'argmax.
+        self.sample = sample
         self.frozen = {h: self.models[h] for h in
                         ['riichi', 'chow', 'pong', 'kong']}
 
@@ -76,12 +79,19 @@ class SLWeakAgent:
         with torch.no_grad():
             logits = self.models['discard'](on)
             masked = logits + (mask_t - 1.0) * 1e9
+            if self.sample:
+                probs = torch.softmax(masked, dim=-1)
+                return int(torch.multinomial(probs, 1).item())
         return int(masked.argmax(dim=-1).item())
 
 class RLAgent:
     def __init__(self, checkpoint, sl_discard, sl_frozen, device='cpu',
-                 sample=False):
+                 sample=False, oracle_gamma=0.0):
         self.sample = sample
+        # [DIAG ORACLE] 0.0 = deploiement (oracle coupe) ; 1.0 = oracle
+        # complet visible. Comparer les deux rangs sur le meme checkpoint
+        # dit si la policy utilise reellement l'info cachee.
+        self.oracle_gamma = oracle_gamma
         from mahjong_ai.agents.oracle_agent import OracleDiscardAgent
         self.agent = OracleDiscardAgent(sl_discard, sl_frozen, device=device)
         ck = torch.load(checkpoint, map_location=device, weights_only=False)
@@ -110,7 +120,8 @@ class RLAgent:
         mask_t = torch.as_tensor(mask, dtype=torch.float32,
                                   device=self.device).unsqueeze(0)
         with torch.no_grad():
-            logits, _, _ = self.agent.forward_with_dropout(on, oo, gamma_t=0.0)
+            logits, _, _ = self.agent.forward_with_dropout(
+                on, oo, gamma_t=self.oracle_gamma)
             masked = logits + (mask_t - 1.0) * 1e9
             if self.sample:
                 # [EVAL] politique echantillonnee, comme a l'entrainement
@@ -124,7 +135,7 @@ class RLAgent:
 # ====================================================================== #
 def eval_worker(worker_id, n_games, agent_checkpoint, sl_discard,
                  sl_frozen, weak_dir, device='cpu', seed=0, sample=False,
-                 worker_offset=0):
+                 worker_offset=0, oracle_gamma=0.0, weak_sample=False):
     """Chaque worker : charge ses propres modeles (thread-safe car process).
 
     Retourne (n1, n2, n3, n4) sur n_games parties.
@@ -140,8 +151,8 @@ def eval_worker(worker_id, n_games, agent_checkpoint, sl_discard,
     t_load = time.time()
     torch.manual_seed(seed + worker_id)
     rl_agent = RLAgent(agent_checkpoint, sl_discard, sl_frozen, device,
-                       sample=sample)
-    weak = SLWeakAgent(weak_dir, device)
+                       sample=sample, oracle_gamma=oracle_gamma)
+    weak = SLWeakAgent(weak_dir, device, sample=weak_sample)
     print(f"[worker {worker_id}] modeles charges en "
           f"{time.time()-t_load:.1f}s (threads={threads})", flush=True)
 
@@ -254,7 +265,8 @@ def evaluate(args):
             continue
         tasks.append((i, splits[i], args.agent_checkpoint, args.sl_discard,
                        args.sl_frozen, args.weak_dir, device, args.seed,
-                       args.sample, sum(splits[:i])))
+                       args.sample, sum(splits[:i]), args.oracle_gamma,
+                       args.weak_sample))
 
     print(f"[eval] lancement de {len(tasks)} workers...", flush=True)
 
@@ -286,6 +298,10 @@ def evaluate(args):
     print(f"  Rang moyen           : {mr:.3f} +- {mr_ci:.3f} (95 %)  "
           f"[2.500 = niveau egal]")
     print(f"  Stable rank (Tenhou) : {sr:.4f}  IC95 [{sr_lo:.2f}, {sr_hi:.2f}]")
+    print(f"  Oracle (gamma)       : {args.oracle_gamma} "
+          f"(0 = deploiement, 1 = oracle complet)")
+    print(f"  Adversaires SL       : "
+          f"{'echantillonnes' if args.weak_sample else 'argmax'}")
     print(f"  Mode joueur eval     : "
           f"{'echantillonne' if args.sample else 'argmax'}, sieges alternes")
     if total < 1000:
@@ -309,6 +325,12 @@ def main():
     p.add_argument('--sample', action='store_true',
                    help='le RL echantillonne sa politique (comme a '
                         "l'entrainement) au lieu de l'argmax")
+    p.add_argument('--oracle-gamma', type=float, default=0.0,
+                   help='[DIAG] proportion d oracle visible pour le RL : '
+                        '0 = deploiement (defaut), 1 = oracle complet')
+    p.add_argument('--weak-sample', action='store_true',
+                   help='[DIAG] les 3 adversaires SL echantillonnent '
+                        "(au lieu de l'argmax)")
     args = p.parse_args()
     evaluate(args)
 

@@ -39,7 +39,9 @@ def worker_loop(worker_id, state, lock, transitions_queue,
                 stats_proxy,
                 sl_discard_path, sl_frozen_dir,
                 grp_path=None,
-                n_games_per_cycle=10, device='cpu'):
+                n_games_per_cycle=10, device='cpu',
+                opponent_sl=False, opponent_mode='argmax',
+                danger_penalty=0.0):
     """
     [NIVEAU 2] Les transitions passent par une mp.Queue au lieu d'une
     liste proxy Manager.
@@ -54,6 +56,13 @@ def worker_loop(worker_id, state, lock, transitions_queue,
         grp_path           : chemin du checkpoint GRP (optionnel)
         n_games_per_cycle  : parties jouees avant re-sync des poids
         device             : cpu
+        opponent_sl        : True -> 1 siege RL (tire au hasard par partie)
+                             + 3 sieges SL figes ; False -> self-play
+        opponent_mode      : 'argmax' | 'sample' pour les SL adversaires
+        danger_penalty     : > 0 -> penalite ajoutee a la reward de chaque
+                             decision du siege RL qui defausse une tuile
+                             'dangereuse' (ferait ron a un adversaire
+                             tenpai, d'apres les mains cachees de l'env)
     """
     # [FIX] Limite les threads PyTorch par worker pour eviter
     # l'oversubscription.
@@ -91,7 +100,10 @@ def worker_loop(worker_id, state, lock, transitions_queue,
                   game_log_buffer=None, n_rounds=4,
                   game_format="tonpuu")
     env.round_env.frozen_sl = agent.frozen_sl
-    print(f"[worker {worker_id}] demarre (n_rounds=4)", flush=True)
+    env.round_env.compute_danger = bool(danger_penalty > 0)
+    print(f"[worker {worker_id}] demarre (n_rounds=4, "
+          f"opponent_sl={opponent_sl})", flush=True)
+    seat_rng = np.random.RandomState(1000 + worker_id)
 
     while True:
         policy_state, critic_state, step, alpha, gamma_t = \
@@ -106,7 +118,14 @@ def worker_loop(worker_id, state, lock, transitions_queue,
         agent.set_eval_mode()
 
         for _ in range(n_games_per_cycle):
-            transitions, game_stats = _play_one_game(env, agent, gamma_t)
+            # [ADVERSAIRES SL] siege RL aleatoire : GameEnv demarre toujours
+            # avec le joueur 0 comme donneur -> tirer le siege RL randomise
+            # aussi le vent de depart / l'ordre de jeu.
+            agent_player = int(seat_rng.randint(4)) if opponent_sl else None
+            transitions, game_stats = _play_one_game(
+                env, agent, gamma_t, agent_player=agent_player,
+                opponent_argmax=(opponent_mode == 'argmax'),
+                danger_penalty=danger_penalty)
             if transitions:
                 # [NIVEAU 2] put au lieu de buffer_add.
                 # timeout : ne pas bloquer indefiniment si le trainer est
@@ -176,10 +195,12 @@ def _update_stats(stats_proxy, lock, game_stats):
         # non gerees (doivent rester a 0 : sinon une tete SL figee est
         # cassee).
         for k in ('n_riichi', 'n_pon', 'n_chi', 'n_kan', 'n_ron_refused',
-                  'n_sl_errors', 'n_unhandled'):
+                  'n_sl_errors', 'n_unhandled', 'n_rl_discards',
+                  'n_danger_discards'):
             stats_proxy[k] = stats_proxy.get(k, 0) + game_stats.get(k, 0)
 
-def _play_one_game(env, agent, gamma_t):
+def _play_one_game(env, agent, gamma_t, agent_player=None,
+                   opponent_argmax=True, danger_penalty=0.0):
     """Joue une partie COMPLETE (4 rounds + repeats).
 
     [FIX MULTI-SEAT REWARD] Le reward de la manche k est attribue a
@@ -188,6 +209,10 @@ def _play_one_game(env, agent, gamma_t):
     l'assignait qu'a la DERNIERE transition -- 98 pourcent des
     transitions avaient reward=0, diluant le signal d'apprentissage par
     ~50x.
+
+    [ADVERSAIRES SL] agent_player=None : self-play (4 sieges RL).
+    agent_player=k : seul le joueur k joue avec la policy RL et produit des
+    transitions ; les 3 autres jouent la policy SL figee (sans transition).
     """
     transitions = []
     pending_reward = {s: 0.0 for s in range(4)}
@@ -202,6 +227,8 @@ def _play_one_game(env, agent, gamma_t):
         'n_exhaustive': 0,
         'n_abortive': 0,
         'n_unhandled': 0,
+        'n_rl_discards': 0,
+        'n_danger_discards': 0,
     }
     # [STATS] snapshot des compteurs cumules de l'env (par process) pour
     # en deduire les deltas de CETTE partie : riichi, appels, ron refuses.
@@ -214,11 +241,18 @@ def _play_one_game(env, agent, gamma_t):
         env_action = None
         logp = value = 0.0
         obs_n = obs_o = mask = None
+        danger = None
 
-        if req['action_type'] == DISCARD:
+        if req['action_type'] == DISCARD and agent_player is not None \
+                and seat != agent_player:
+            # Adversaire SL fige : pas de transition enregistree.
+            env_action = agent.select_action_sl(
+                req['obs'], req['mask'], argmax=opponent_argmax)
+        elif req['action_type'] == DISCARD:
             obs_n = req['obs']
             obs_o = req['oracle']
             mask = req['mask']
+            danger = req.get('danger')
             action, logp, value, masked_obs_o = agent.select_action(
                 obs_n, obs_o, mask, gamma_t)
             env_action = action
@@ -239,6 +273,12 @@ def _play_one_game(env, agent, gamma_t):
             # sa prochaine transition plutot que le perdre.
             carried_reward = pending_reward[seat]
             pending_reward[seat] = 0.0
+            # [DANGER] penalite par decision : tuile qui ferait ron
+            if danger is not None:
+                stats['n_rl_discards'] += 1
+                if float(danger[action]) > 0:
+                    stats['n_danger_discards'] += 1
+                    carried_reward -= danger_penalty
             transitions.append({
                 'seat': seat,
                 # [FIX MEMOIRE] float16 : ~18 Ko au lieu de ~36 Ko par coup.
@@ -247,6 +287,9 @@ def _play_one_game(env, agent, gamma_t):
                 # float32 (torch.as_tensor(..., dtype=float32)).
                 'obs_normal': np.asarray(obs_n, dtype=np.float16),
                 'obs_oracle': masked_obs_o,
+                # [CRITIC] oracle COMPLET (petit : 4x34 floats) pour le
+                # critic asymetrique / la baseline V(s).
+                'obs_oracle_full': np.asarray(obs_o, dtype=np.float32),
                 'mask': mask,
                 'action': action,
                 'logp': logp,
@@ -308,7 +351,9 @@ def _play_one_game(env, agent, gamma_t):
 
     scores = env.game_scores
     order = sorted(range(4), key=lambda p: (-scores[p], p))
-    rank_of_seat0 = order.index(0) + 1
+    # [ADVERSAIRES SL] rang du siege RL (cle conservee : 'rank_of_seat0')
+    tracked = 0 if agent_player is None else agent_player
+    rank_of_seat0 = order.index(tracked) + 1
 
     stats['rank_of_seat0'] = rank_of_seat0
     stats['n_honba'] = max_honba

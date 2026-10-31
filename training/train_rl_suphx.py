@@ -87,6 +87,8 @@ STATS_KEYS_INIT = {
     'n_ron_refused': 0,
     'n_sl_errors': 0,       # doit rester 0 (tete SL figee en erreur)
     'n_unhandled': 0,       # doit rester 0 (requete non-DISCARD inattendue)
+    'n_rl_discards': 0,     # [DANGER] decisions du siege RL (si penalite)
+    'n_danger_discards': 0,
 }
 
 
@@ -130,9 +132,11 @@ def format_game_stats(stats_proxy):
     line = (
         f"n={n_games} "
         f"[{n1}/{n2}/{n3}/{n4}] "
-        # NB : wr/mean_rank concernent le siege 0 ; les 4 sieges partagent
-        # la meme policy -> esperance 0.25 / 2.50 par symetrie. Ce n'est
-        # PAS une mesure de progres (utiliser eval_stable_rank vs SL).
+        # NB : sans --opponent-sl, wr/mean_rank concernent le siege 0 ; les 4
+        # sieges partagent la meme policy -> 0.25 / 2.50 par symetrie, PAS
+        # une mesure de progres. Avec --opponent-sl, ce sont les stats du
+        # siege RL (siege tire au hasard) contre 3 SL : 2.50 = niveau SL,
+        # < 2.50 = le RL progresse (bruit ~ +-0.07 pour 1000 parties).
         f"wr={win_rate:.3f} "
         f"mean_rank={mean_rank:.2f} "
         f"rounds={mean_rounds:.2f} "
@@ -145,6 +149,10 @@ def format_game_stats(stats_proxy):
         f"calls/rnd={calls_rnd:.2f} "
         f"ron_refus/rnd={refused_rnd:.2f}"
     )
+    n_rl = stats_proxy.get('n_rl_discards', 0)
+    if n_rl:
+        # [DANGER] % de defausses du siege RL qui feraient ron : doit BAISSER
+        line += (f" dng%={100 * stats_proxy.get('n_danger_discards', 0) / n_rl:.2f}")
     n_err = stats_proxy.get('n_sl_errors', 0)
     n_unh = stats_proxy.get('n_unhandled', 0)
     if n_err or n_unh:
@@ -197,7 +205,9 @@ def compute_drift_metrics(batch):
     if not batch:
         return None
 
-    actions = [t['action'] for t in batch if t.get('seat') == 0]
+    # [FIX] en mode --opponent-sl le siege RL est tire au hasard : filtrer
+    # sur le siege 0 donnait souvent 0 action (fausse alerte COLLAPSE).
+    actions = [t['action'] for t in batch]
     if actions:
         counter = collections.Counter(actions)
         top3 = counter.most_common(3)
@@ -267,42 +277,91 @@ def get_phase_and_gamma(step, total_steps,
 # ---------------------------------------------------------------------- #
 # GAE
 # ---------------------------------------------------------------------- #
-def compute_advantages(transitions, gamma=0.99, lam=0.95):
-    """[FIX MULTI-SEAT GAE] Remplace le GAE par la baseline batch-mean
-    du papier Suphx.
+class Episode(list):
+    """Une partie (liste de transitions) + compteur d'utilisations."""
+    uses = 0
 
-    ANCIEN BUG : le GAE bootstrapait a travers des transitions
-    interlevees de 4 sieges differents. Entre deux transitions du MEME
-    siege, il y avait 3 transitions d'autres sieges dont les values
-    polluaient le TD-error. Les advantages resultant n'avaient aucune
-    signification -- le policy gradient etait du bruit pur des la phase 2
-    (quand l'agent doit apprendre sans oracle, il depend des advantages).
 
-    Le papier n'utilise PAS de GAE ni de critic :
-        A(s,a) = r_batch - mean(r_batch)
-    Cette formule est immunisee contre l'interleaving multi-sieges.
+def _critic_values(agent, transitions, reward_scale, chunk=512):
+    """V(s) du critic (oracle complet) en unites de reward, sans gradient."""
+    out = []
+    for i in range(0, len(transitions), chunk):
+        part = transitions[i:i + chunk]
+        on = torch.as_tensor(np.stack([t['obs_normal'] for t in part]),
+                             dtype=torch.float32, device=agent.device)
+        oo = torch.as_tensor(
+            np.stack([t.get('obs_oracle_full', t['obs_oracle'])
+                      for t in part]),
+            dtype=torch.float32, device=agent.device)
+        with torch.no_grad():
+            v = agent.critic(torch.cat([on, oo], dim=1))
+        out.append(v.cpu().numpy())
+    return np.concatenate(out).astype(np.float32) * reward_scale
+
+
+def advantages_from_values(rewards, values, min_ev=0.0):
+    """Avantage = R - V(s) (baseline apprise) ; repli sur R - mean(R) si le
+    critic n'explique pas la variance (EV < min_ev).
+
+    Retourne (advs_bruts, ev, used_critic). Fonction pure (numpy) : testable.
+    """
+    rewards = np.asarray(rewards, dtype=np.float32)
+    var_r = float(rewards.var())
+    if values is None or var_r < 1e-8:
+        return rewards - rewards.mean(), 0.0, False
+    resid = rewards - np.asarray(values, dtype=np.float32)
+    ev = 1.0 - float(resid.var()) / var_r
+    if ev < min_ev:
+        return rewards - rewards.mean(), ev, False
+    return resid, ev, True
+
+
+def compute_advantages(transitions, gamma=0.99, lam=0.95, agent=None,
+                       adv_mode='batch_mean', reward_scale=10.0, min_ev=0.0):
+    """Avantages des transitions.
+
+    adv_mode='batch_mean' (ancien comportement, papier Suphx) :
+        A = R - mean(R_batch)
+    adv_mode='critic' :
+        A = R - V(s), V = critic asymetrique (voit l'oracle complet),
+        entraine a predire la reward de la manche (R / reward_scale).
+        R est la reward GRP de la manche, identique pour toutes les
+        decisions du siege dans la manche ; avec gamma=1 et fin de manche
+        terminale, le GAE(lambda=1) se reduit exactement a R - V(s_t) :
+        c'est la forme sans biais, immunisee contre l'interleaving des
+        sieges (aucun bootstrap entre transitions).
+
+    Positionne compute_advantages.last_ev / .last_used_critic (logs).
     """
     rewards = np.array([t['reward'] for t in transitions], dtype=np.float32)
 
-    # Baseline = moyenne du batch (papier, eq. informelle)
-    baseline = rewards.mean()
-    advs = rewards - baseline
+    values = None
+    if adv_mode == 'critic' and agent is not None:
+        values = _critic_values(agent, transitions, reward_scale)
+    advs, ev, used = advantages_from_values(rewards, values, min_ev)
+    compute_advantages.last_ev = ev
+    compute_advantages.last_used_critic = used
 
-    # Normalisation (deja presente dans l'ancien code, garde)
+    # Normalisation (comme avant)
     if len(advs) > 1 and advs.std() > 1e-6:
         advs = (advs - advs.mean()) / (advs.std() + 1e-8)
 
     for i, tr in enumerate(transitions):
         tr['advantage'] = advs[i]
-        tr['return'] = tr['reward']   # pas de bootstrapping
+        tr['return'] = tr['reward']
 
     return advs
+
+
+compute_advantages.last_ev = 0.0
+compute_advantages.last_used_critic = False
 
 # ---------------------------------------------------------------------- #
 # PG + IS loss
 # ---------------------------------------------------------------------- #
 def pg_is_loss(agent, transitions, advantages, gamma_t,
-                clip_eps=0.2, iw_threshold=None, phase=1):
+                clip_eps=0.2, iw_threshold=None, phase=1,
+                critic_mode=False, reward_scale=10.0):
     obs_n = torch.as_tensor(np.stack([t['obs_normal'] for t in transitions]),
                              dtype=torch.float32, device=agent.device)
     obs_o = torch.as_tensor(np.stack([t['obs_oracle'] for t in transitions]),
@@ -317,8 +376,12 @@ def pg_is_loss(agent, transitions, advantages, gamma_t,
                                 dtype=torch.float32, device=agent.device)
     advs = torch.as_tensor(advantages, dtype=torch.float32, device=agent.device)
 
+    oof = None
+    if critic_mode:
+        oof = np.stack([t.get('obs_oracle_full', t['obs_oracle'])
+                        for t in transitions])
     new_logp, values, entropy = agent.evaluate_actions(
-        obs_n, obs_o, masks, actions, gamma_t)
+        obs_n, obs_o, masks, actions, gamma_t, obs_o_full=oof)
     ratio = torch.exp(new_logp - old_logp)
     # [DIAG] ecart moyen du ratio a 1 (lu par la boucle a l'epoch 0).
     # NB : non nul meme sans bug, car le buffer est un replay et les
@@ -341,7 +404,11 @@ def pg_is_loss(agent, transitions, advantages, gamma_t,
     else:
         policy_loss = -(ratio * advs * keep).mean()
 
-    value_loss = ((values - returns) ** 2 * keep).mean()
+    if critic_mode:
+        # cible en unites normalisees (R / reward_scale) : stabilise le MLP
+        value_loss = ((values - returns / reward_scale) ** 2 * keep).mean()
+    else:
+        value_loss = ((values - returns) ** 2 * keep).mean()
     entropy_bonus = entropy.mean()
     return policy_loss, value_loss, entropy_bonus
 
@@ -419,7 +486,7 @@ def train(args):
             try:
                 item = q.get(timeout=1.0)
                 with lock:
-                    rb_list.append(item)
+                    rb_list.append(Episode(item))
                     while len(rb_list) > cap[0]:
                         rb_list.pop(0)
             except _queue_mod.Empty:
@@ -524,7 +591,9 @@ def train(args):
                 stats_proxy,
                 args.sl_discard, args.sl_frozen,
                 args.grp_checkpoint,
-                args.games_per_cycle, device
+                args.games_per_cycle, device,
+                args.opponent_sl, args.opponent_mode,
+                args.danger_penalty,
             ),
             daemon=True,
         )
@@ -569,6 +638,19 @@ def train(args):
 
     last_mem_warn = 0.0
     try:
+        critic_mode = (args.adv_mode == 'critic')
+        if critic_mode and args.value_coef <= 0:
+            print("[train_rl] --adv-mode critic : value-coef force a 1.0 "
+                  "(le critic doit etre entraine)", flush=True)
+            args.value_coef = 1.0
+        warm_until = start_step + (args.critic_warmup_steps
+                                   if critic_mode else 0)
+        warm_announced = [False]
+        if critic_mode:
+            print(f"[train_rl] baseline critic : warmup critic seul jusqu'au "
+                  f"step {warm_until} (policy = SL), reward_scale="
+                  f"{args.reward_scale}, repli batch-mean si EV<"
+                  f"{args.min_ev}", flush=True)
         while step < args.total_steps:
             # [FIX MEMOIRE] Garde RAM : si la memoire systeme depasse le
             # seuil, on reduit durablement la capacite du buffer (et on le
@@ -606,6 +688,16 @@ def train(args):
                     buf_len, size=min(args.batch_episodes, buf_len),
                     replace=False)
                 batch = [rb_local[i] for i in idx]
+                # [REPLAY] limite le nb de reutilisations d'une partie
+                # (sinon chaque transition est rejouee ~20x et la policy /
+                # le critic ajustent le bruit). Les parties epuisees sont
+                # retirees ; si le buffer devient trop petit, la boucle
+                # attend de nouvelles parties.
+                if args.max_episode_reuse > 0:
+                    for ep in batch:
+                        ep.uses += 1
+                    rb_local[:] = [ep for ep in rb_local
+                                   if ep.uses < args.max_episode_reuse]
             # Aplatissement episodes -> transitions (memes semantiques que
             # l'ancien ReplayBuffer.sample : le done=True de fin de partie
             # coupe correctement le bootstrap GAE entre episodes).
@@ -643,7 +735,16 @@ def train(args):
                       flush=True)
 
             # --- Update ---
-            advantages = compute_advantages(batch, gamma=args.gamma, lam=args.lam)
+            warm = critic_mode and step < warm_until
+            if critic_mode and not warm and not warm_announced[0]:
+                warm_announced[0] = True
+                print(f"[step {step}] fin du warmup critic : la policy "
+                      f"s'entraine maintenant avec A = R - V(s)", flush=True)
+            advantages = compute_advantages(
+                batch, gamma=args.gamma, lam=args.lam, agent=agent,
+                adv_mode=('critic' if critic_mode and not warm
+                          else 'batch_mean'),
+                reward_scale=args.reward_scale, min_ev=args.min_ev)
 
             # Multi-epoch PPO : plusieurs passes de gradient par batch
             PPO_EPOCHS = args.ppo_epochs
@@ -662,15 +763,22 @@ def train(args):
                 iw_thresh = args.iw_threshold if phase == 3 else None
                 policy_loss, value_loss, entropy = pg_is_loss(
                     agent, batch, advantages, gamma_t,
-                    clip_eps=args.clip_eps, iw_threshold=iw_thresh, phase=phase)
+                    clip_eps=args.clip_eps, iw_threshold=iw_thresh, phase=phase,
+                    critic_mode=critic_mode, reward_scale=args.reward_scale)
                 if policy_loss is None:
                     break
                 if epoch_i == 0:
                     entropy_first = entropy.item()
                     ratio_dev_first = getattr(agent, 'last_ratio_dev', None)
-                loss = policy_loss + args.value_coef * value_loss - alpha * entropy
+                if warm:
+                    # warmup critic : seule la value loss est optimisee,
+                    # la policy reste le SL.
+                    loss = args.value_coef * value_loss
+                else:
+                    loss = (policy_loss + args.value_coef * value_loss
+                            - alpha * entropy)
                 kl_t = getattr(agent, 'last_kl', None)
-                if args.kl_coef > 0 and kl_t is not None:
+                if (not warm) and args.kl_coef > 0 and kl_t is not None:
                     loss = loss + args.kl_coef * kl_t
                     kl_last = float(kl_t.detach().item())
                 loss.backward()
@@ -678,7 +786,8 @@ def train(args):
                     agent.policy.parameters(), 5.0)
                 critic_gnorm_last = torch.nn.utils.clip_grad_norm_(
                     agent.critic.parameters(), 5.0)
-                agent.policy_optim.step()
+                if not warm:
+                    agent.policy_optim.step()
                 agent.critic_optim.step()
                 policy_loss_last = policy_loss
                 value_loss_last = value_loss
@@ -756,6 +865,11 @@ def train(args):
                 rdev_str = (f"{ratio_dev_first:.3f}"
                             if ratio_dev_first is not None else "n/a")
                 kl_str = f"{kl_last:.4f}" if kl_last is not None else "off"
+                if critic_mode:
+                    ev_str = (f"ev={compute_advantages.last_ev:+.3f}"
+                              f"({'WARMUP' if warm else ('critic' if compute_advantages.last_used_critic else 'repli-mean')}) ")
+                else:
+                    ev_str = ""
 
                 print(f"[step {step:7d} | phase {phase}] "
                       f"pl={policy_loss.item():+.4f} "
@@ -764,6 +878,7 @@ def train(args):
                       f"alpha={alpha:.4f} "
                       f"rdev={rdev_str} "
                       f"kl={kl_str} "
+                      f"{ev_str}"
                       f"gamma={gamma_t:.3f} "
                       f"buf={current_buf}{mem_info} "
                       f"({elapsed:.0f}s)", flush=True)
@@ -907,6 +1022,30 @@ def main():
     p.add_argument('--lam', type=float, default=0.95)
     p.add_argument('--clip-eps', type=float, default=0.2)
     p.add_argument('--value-coef', type=float, default=0.5)
+    p.add_argument('--danger-penalty', type=float, default=0.0,
+                   help="[DANGER] penalite ajoutee a la reward d'une decision "
+                        "qui defausse une tuile qui ferait ron a un "
+                        "adversaire tenpai (calcule avec les mains cachees "
+                        "de l'env, sans toucher au reseau). 0 = desactive. "
+                        "Conseille 0.5-1.0. Donne un feedback dense qui "
+                        "pousse a utiliser l'oracle puis a deviner le danger.")
+    p.add_argument('--adv-mode', choices=['batch_mean', 'critic'],
+                   default='batch_mean',
+                   help="avantage : 'batch_mean' (A = R - moyenne du batch, "
+                        "ancien) ou 'critic' (A = R - V(s), critic "
+                        "asymetrique entraine a predire la reward de la "
+                        "manche ; reduit fortement la variance)")
+    p.add_argument('--critic-warmup-steps', type=int, default=300000,
+                   help="[critic] steps pendant lesquels seul le critic "
+                        "s'entraine (policy = SL) avant d'utiliser V(s)")
+    p.add_argument('--reward-scale', type=float, default=10.0,
+                   help="[critic] la cible du critic est R/reward_scale")
+    p.add_argument('--min-ev', type=float, default=0.0,
+                   help="[critic] si la variance expliquee du critic est "
+                        "< min-ev sur un batch, repli sur batch-mean")
+    p.add_argument('--max-episode-reuse', type=int, default=0,
+                   help="nb max d'utilisations d'une partie du buffer "
+                        "(0 = illimite, ancien comportement ; conseille 4)")
     p.add_argument('--h-target', type=str, default='2.0',
                    help="entropie cible (Eq. 3) : un nombre, ou 'auto' = "
                         "entropie mesuree de la policy au demarrage "
@@ -939,6 +1078,17 @@ def main():
                    help='[ANCRE] poids de KL(pi || pi_SL) dans la loss. '
                         '0 = desactive. Plage utile 0.02-0.2 : trop bas -> '
                         'derive passive ; trop haut -> reste colle au SL.')
+    p.add_argument('--opponent-sl', action='store_true',
+                   help='[ADVERSAIRES SL] 1 siege = policy RL (entrainee), '
+                        '3 sieges = policy SL figee. Le siege RL est tire '
+                        'au hasard a chaque partie (donc vent de depart '
+                        'et ordre de jeu randomises). Seul le siege RL '
+                        'produit des transitions. Defaut : self-play 4 '
+                        'sieges RL.')
+    p.add_argument('--opponent-mode', choices=['argmax', 'sample'],
+                   default='argmax',
+                   help='comportement des SL adversaires : argmax (comme '
+                        "l'eval, defaut) ou sample (plus de diversite).")
     p.add_argument('--milestone-every', type=int, default=1000000,
                    help='un checkpoint *_milestoneN.pt jamais purge tous '
                         'les N steps (0 = desactive)')

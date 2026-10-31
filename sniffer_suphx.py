@@ -46,15 +46,15 @@ HAND_SIZE = 13
 INITIAL_WALL_SIZE = 70
 COPIES_PER_TILE = 4
 
-CHECKPOINT_DIR = os.environ.get("SL_CHECKPOINT_DIR", "checkpoints/rl_final")
+CHECKPOINT_DIR = os.environ.get("SL_CHECKPOINT_DIR", "checkpoints/")
 USE_SL = os.environ.get("SL_ENABLE", "1") == "1"
 USE_LOOKAHEAD = os.environ.get("SL_USE_LOOKAHEAD", "1") == "1"
 
 # [pMCPA] Config via variables d'environnement
 PMCPA_ENABLE = os.environ.get("PMCPA_ENABLE", "1") == "1"
-PMCPA_K = int(os.environ.get("PMCPA_K", "5"))
+PMCPA_K = int(os.environ.get("PMCPA_K", "30"))
 PMCPA_LR = float(os.environ.get("PMCPA_LR", "1e-4"))
-PMCPA_GRAD_STEPS = int(os.environ.get("PMCPA_GRAD_STEPS", "2"))
+PMCPA_GRAD_STEPS = int(os.environ.get("PMCPA_GRAD_STEPS", "3"))
 PMCPA_TIMEOUT = float(os.environ.get("PMCPA_TIMEOUT", "60"))
 
 KEYS = [0x84, 0x5E, 0x4E, 0x42, 0x39, 0xA2, 0x1F, 0x60, 0x1C]
@@ -146,6 +146,28 @@ def _extract_single_tile(data):
             if idx >= 0:
                 return idx, key
     return -1, None
+
+
+def disp_hand(hand, red_hand):
+    """Main triee ; la copie rouge d'un 5 s'affiche 5mr / 5pr / 5sr."""
+    out, shown = [], set()
+    for t in sorted(hand):
+        k = _RED_TYPES.index(t) if t in _RED_TYPES else -1
+        if k >= 0 and red_hand[k] and k not in shown:
+            shown.add(k)
+            out.append(tile_str(t) + "r")
+        else:
+            out.append(tile_str(t))
+    return " ".join(out)
+
+
+def disp_tile(state, t):
+    """5m -> '5mr' (ou '5mr/5m' si j'ai aussi une copie normale) quand
+    j'ai le rouge en main ; l'IA choisit un TYPE de tuile, pas la copie."""
+    s = tile_str(t)
+    if t in _RED_TYPES and state.red_hand[_RED_TYPES.index(t)]:
+        return s + "r" if state.hand.count(t) <= 1 else s + "r/" + s
+    return s
 
 
 def tile_str(idx):
@@ -678,7 +700,7 @@ class GameState:
                 if k >= 0:
                     self.red_hand[k] = True
             self.update_counts()
-            hand_display = " ".join(tile_str(t) for t in sorted(self.hand))
+            hand_display = disp_hand(self.hand, self.red_hand)
             _say(f"Main initiale ({len(self.hand)} tuiles) : {hand_display}")
         if "left_tile_count" in data:
             self.wall_remaining = data["left_tile_count"]
@@ -1575,7 +1597,7 @@ def compute_final_recommendation(state, head_probs, phase):
         if discard_probs is not None:
             best_idx = int(np.argmax(discard_probs))
             return ("DISCARD", float(discard_probs[best_idx]),
-                    tile_str(best_idx))
+                    disp_tile(state, best_idx))
         return None
 
     return None
@@ -1586,7 +1608,7 @@ def compute_final_recommendation(state, head_probs, phase):
 # ═══════════════════════════════════════════════════════════════════════
 
 def show_all_heads(state, head_probs, phase, inference_tag=""):
-    hand_str = " ".join(tile_str(t) for t in sorted(state.hand))
+    hand_str = disp_hand(state.hand, state.red_hand)
     meld_str = " ".join(
         f"[{' '.join(tile_str(t) for t in m['tiles'])}]" for m in state.melds
     )
@@ -1638,7 +1660,7 @@ def show_all_heads(state, head_probs, phase, inference_tag=""):
         m = _normalized(probs, mask)
         if m is not None:
             top5 = np.argsort(-m)[:5]
-            top5_str = "  ".join(f"{tile_str(int(t))}({m[t]:.2f})"
+            top5_str = "  ".join(f"{disp_tile(state, int(t))}({m[t]:.2f})"
                                   for t in top5 if m[t] > 0.01)
             print(f"  DISCARD  {top5_str}", flush=True)
 

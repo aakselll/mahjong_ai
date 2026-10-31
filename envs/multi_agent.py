@@ -98,6 +98,11 @@ class MultiAgentMahjongEnv:
         # Si None, ces tetes yield une request comme avant.
         # Si dict {'riichi': model, ...}, le modele SL decide directement.
         self.frozen_sl = frozen_sl_models
+        # [DANGER] si True, les requetes DISCARD contiennent 'danger'
+        # (34 flottants) : 1 si discarder cette tuile donnerait ron a un
+        # adversaire non-furiten tenpai sur cette attente. Label supervise
+        # pour la tete auxiliaire (cout : quelques shanten par requete).
+        self.compute_danger = False
         self._gen = None
         self.hands = None
         self.melds = None
@@ -884,9 +889,36 @@ class MultiAgentMahjongEnv:
             r[s] -= EXHAUSTIVE_SHANTEN_COEF * max(sh, 0)
         return r
 
+    def _danger_labels(self, seat):
+        """danger[t] = 1 si un adversaire tenpai (hors furiten) attend t.
+
+        Utilise les mains cachees : sert de cible supervisee dense pour
+        apprendre a predire le danger des tuiles. Ignore le yaku.
+        """
+        danger = np.zeros(N_TILES, dtype=np.float32)
+        for o in self._others(seat):
+            base = self._shanten_counts(o)
+            if int(base.sum()) != 13:
+                continue
+            if shanten_of(base.tolist()) != 0:
+                continue
+            if self._is_furiten(o):
+                continue
+            for t in range(N_TILES):
+                if base[t] >= 4:
+                    continue
+                trial = base.copy()
+                trial[t] += 1
+                if shanten_of(trial.tolist()) == -1:
+                    danger[t] = 1.0
+        return danger
+
     def _request(self, seat, action_type, obs, mask):
-        return {"seat": seat, "action_type": action_type, "obs": obs, "mask": mask,
-                "oracle": self._pending_oracle}
+        req = {"seat": seat, "action_type": action_type, "obs": obs, "mask": mask,
+               "oracle": self._pending_oracle}
+        if self.compute_danger and action_type == DISCARD:
+            req["danger"] = self._danger_labels(seat)
+        return req
 
     @staticmethod
     def _combine(imm_reward, acting_seat, next_request):

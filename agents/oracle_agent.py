@@ -218,8 +218,10 @@ class OracleDiscardAgent:
             action = dist.sample()
             logp = dist.log_prob(action)
             
-            # Critic (inutilise avec value_coef=0 mais garde pour compat)
-            value = self.critic(x).item()
+            # [CRITIC ASYMETRIQUE] le critic voit l'oracle COMPLET (non
+            # masque) : il sert de baseline V(s) et n'est pas utilise au
+            # deploiement, donc il peut tricher avec l'info cachee.
+            value = self.critic(torch.cat([on, oo], dim=1)).item()
 
         # [FIX] Retourner l'oracle MASQUE (pas le brut)
         masked_obs_oracle = oo_masked.squeeze(0).cpu().numpy()
@@ -227,7 +229,31 @@ class OracleDiscardAgent:
         return int(action.item()), logp.item(), value, masked_obs_oracle
 
     # ------------------------------------------------------------------ #
-    def evaluate_actions(self, obs_n, obs_o, masks, actions, gamma_t):
+    def select_action_sl(self, obs_normal, mask, argmax=True):
+        """Action de la policy SL GELEE (ref_policy), pour les adversaires.
+
+        Entree = obs normale + canaux oracle a zero (le SL n'a jamais vu
+        l'oracle : ses poids oracle sont a zero). Aucune transition n'est
+        enregistree pour ces sieges.
+        argmax=True : meme protocole que l'eval ; False : echantillonnage.
+        """
+        on = torch.as_tensor(obs_normal, dtype=torch.float32,
+                             device=self.device).unsqueeze(0)
+        mask_t = torch.as_tensor(mask, dtype=torch.float32,
+                                 device=self.device).unsqueeze(0)
+        oo = torch.zeros(1, ORACLE_DIM, on.shape[-1], dtype=torch.float32,
+                         device=self.device)
+        x = torch.cat([on, oo], dim=1)
+        with torch.no_grad():
+            logits = self.ref_policy(x) + (mask_t - 1.0) * 1e9
+            if argmax:
+                return int(logits.argmax(dim=1).item())
+            return int(torch.distributions.Categorical(
+                logits=logits).sample().item())
+
+    # ------------------------------------------------------------------ #
+    def evaluate_actions(self, obs_n, obs_o, masks, actions, gamma_t,
+                         obs_o_full=None):
         """Evalue les log-probs des actions sous la policy courante.
         
         [FIX ORACLE GUIDING] obs_o est DEJA MASQUE (stocke depuis la
@@ -252,7 +278,14 @@ class OracleDiscardAgent:
         dist = torch.distributions.Categorical(logits=masked_logits)
         logp = dist.log_prob(actions)
         
-        values = self.critic(x)
+        # [CRITIC ASYMETRIQUE] si l'oracle complet est fourni, le critic
+        # l'utilise (au lieu de l'oracle masque par le dropout).
+        if obs_o_full is not None:
+            oof = torch.as_tensor(obs_o_full, dtype=torch.float32,
+                                  device=self.device)
+            values = self.critic(torch.cat([on, oof], dim=1))
+        else:
+            values = self.critic(x)
         # Entropie sur les actions valides
         log_probs = torch.log_softmax(masked_logits, dim=-1)
         probs = torch.exp(log_probs)

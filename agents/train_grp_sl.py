@@ -245,7 +245,10 @@ class GRPDataset(Dataset):
             padded[:T] = feats
         else:
             padded = feats[:self.max_rounds]
-        return padded, reward
+            T = self.max_rounds
+        # [FIX GRP] on renvoie aussi la longueur reelle (pour masquer le
+        # padding dans la loss : prediction a CHAQUE manche reelle).
+        return padded, reward, T
 
 # ====================================================================== #
 # Entrainement
@@ -261,6 +264,7 @@ def main():
     p.add_argument('--lr', type=float, default=1e-3)
     p.add_argument('--hidden-dim', type=int, default=64)
     p.add_argument('--cache-path', type=str, default=None)
+    p.add_argument('--val-fraction', type=float, default=0.05)
     args = p.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -268,21 +272,60 @@ def main():
 
     ds = GRPDataset(args.data_dir, max_files=args.max_files,
                     cache_path=args.cache_path)
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
+
+    # [FIX GRP] vraie validation (avant : 'val_loss' = loss d'entrainement)
+    n_val = max(1, int(len(ds) * args.val_fraction))
+    gen = torch.Generator().manual_seed(0)
+    train_ds, val_ds = torch.utils.data.random_split(
+        ds, [len(ds) - n_val, n_val], generator=gen)
+    loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                         num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size,
+                            shuffle=False, num_workers=0)
 
     model = RewardPredictor(hidden_dim=args.hidden_dim).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
-    # Loss ponderee pour les rewards extremes
-    def weighted_loss(pred, target):
-        mse = (pred - target) ** 2
-        weights = torch.where(
+    def masked_loss(pred, target, lens):
+        """[FIX GRP] Eq. 4 du papier Suphx : MSE entre Phi(x^1..x^j) et le
+        reward final R, moyennee sur TOUTES les manches j reelles d'une
+        partie (padding exclu), puis sur les parties.
+        Avant : seule la sortie du DERNIER pas (souvent un pas de padding)
+        etait supervisee -> Phi(x^k) des manches intermediaires, qui sert
+        de reward RL (Phi_k - Phi_{k-1}), n'etait jamais entraine."""
+        T = pred.shape[1]
+        steps = torch.arange(T, device=pred.device)[None, :]
+        mask = (steps < lens[:, None]).float()
+        err = (pred - target[:, None]) ** 2
+        w = torch.where(
             torch.abs(target) > EXTREME_REWARD_THRESHOLD,
-            EXTREME_REWARD_WEIGHT,
-            1.0,
-        )
-        return (mse * weights).mean()
+            torch.full_like(target, EXTREME_REWARD_WEIGHT),
+            torch.ones_like(target))[:, None]
+        per_game = (err * w * mask).sum(1) / mask.sum(1).clamp(min=1.0)
+        return per_game.mean()
+
+    def evaluate():
+        """Loss de validation + R2 par position de manche (1..4)."""
+        model.eval()
+        tot, n = 0.0, 0
+        se = np.zeros(MAX_ROUNDS); cnt = np.zeros(MAX_ROUNDS)
+        ys = []
+        with torch.no_grad():
+            for x, y, lens in val_loader:
+                x = x.to(device); y = y.float().to(device)
+                lens = lens.to(device)
+                pred = model(x)
+                tot += masked_loss(pred, y, lens).item() * len(y)
+                n += len(y)
+                ys.append(y.cpu().numpy())
+                err = ((pred - y[:, None]) ** 2).cpu().numpy()
+                for j in range(MAX_ROUNDS):
+                    m = (lens.cpu().numpy() > j)
+                    se[j] += err[m, j].sum(); cnt[j] += m.sum()
+        var = float(np.concatenate(ys).var()) if ys else 1.0
+        r2 = [1.0 - (se[j] / cnt[j]) / var if cnt[j] else float('nan')
+              for j in range(min(6, MAX_ROUNDS))]
+        return tot / max(n, 1), r2
 
     best_loss = float('inf')
     for epoch in range(args.epochs):
@@ -290,11 +333,12 @@ def main():
         total_loss = 0.0
         n_batches = 0
 
-        for x, y in loader:
+        for x, y, lens in loader:
             x = x.to(device)
-            y = y.to(device)
-            pred = model(x)[:, -1]
-            loss = weighted_loss(pred, y)
+            y = y.float().to(device)
+            lens = lens.to(device)
+            pred = model(x)                       # (B, T) toutes les manches
+            loss = masked_loss(pred, y, lens)
 
             optimizer.zero_grad()
             loss.backward()
@@ -303,18 +347,21 @@ def main():
             n_batches += 1
 
         avg_loss = total_loss / max(n_batches, 1)
-        print(f"[GRP] epoch {epoch+1}/{args.epochs} loss={avg_loss:.4f}")
+        val_loss, r2 = evaluate()
+        print(f"[GRP] epoch {epoch+1}/{args.epochs} train={avg_loss:.4f} "
+              f"val={val_loss:.4f}  R2 par manche 1..{len(r2)} : "
+              + " ".join(f"{v:.2f}" for v in r2))
 
-        if avg_loss < best_loss:
-            best_loss = avg_loss
+        if val_loss < best_loss:
+            best_loss = val_loss
             torch.save({
                 'model_state_dict': model.state_dict(),
                 'feature_dim': FEATURE_DIM,
                 'hidden_dim': args.hidden_dim,
-                'val_loss': avg_loss,
+                'val_loss': val_loss,
                 'epoch': epoch + 1,
             }, args.output)
-            print(f"  -> save ({args.output}, loss={avg_loss:.4f})")
+            print(f"  -> save ({args.output}, val={val_loss:.4f})")
 
 if __name__ == '__main__':
     main()
