@@ -87,8 +87,6 @@ STATS_KEYS_INIT = {
     'n_ron_refused': 0,
     'n_sl_errors': 0,       # doit rester 0 (tete SL figee en erreur)
     'n_unhandled': 0,       # doit rester 0 (requete non-DISCARD inattendue)
-    'n_rl_discards': 0,     # [DANGER] decisions du siege RL (si penalite)
-    'n_danger_discards': 0,
 }
 
 
@@ -149,10 +147,6 @@ def format_game_stats(stats_proxy):
         f"calls/rnd={calls_rnd:.2f} "
         f"ron_refus/rnd={refused_rnd:.2f}"
     )
-    n_rl = stats_proxy.get('n_rl_discards', 0)
-    if n_rl:
-        # [DANGER] % de defausses du siege RL qui feraient ron : doit BAISSER
-        line += (f" dng%={100 * stats_proxy.get('n_danger_discards', 0) / n_rl:.2f}")
     n_err = stats_proxy.get('n_sl_errors', 0)
     n_unh = stats_proxy.get('n_unhandled', 0)
     if n_err or n_unh:
@@ -593,7 +587,6 @@ def train(args):
                 args.grp_checkpoint,
                 args.games_per_cycle, device,
                 args.opponent_sl, args.opponent_mode,
-                args.danger_penalty,
             ),
             daemon=True,
         )
@@ -1022,13 +1015,6 @@ def main():
     p.add_argument('--lam', type=float, default=0.95)
     p.add_argument('--clip-eps', type=float, default=0.2)
     p.add_argument('--value-coef', type=float, default=0.5)
-    p.add_argument('--danger-penalty', type=float, default=0.0,
-                   help="[DANGER] penalite ajoutee a la reward d'une decision "
-                        "qui defausse une tuile qui ferait ron a un "
-                        "adversaire tenpai (calcule avec les mains cachees "
-                        "de l'env, sans toucher au reseau). 0 = desactive. "
-                        "Conseille 0.5-1.0. Donne un feedback dense qui "
-                        "pousse a utiliser l'oracle puis a deviner le danger.")
     p.add_argument('--adv-mode', choices=['batch_mean', 'critic'],
                    default='batch_mean',
                    help="avantage : 'batch_mean' (A = R - moyenne du batch, "
