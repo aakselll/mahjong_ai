@@ -512,6 +512,9 @@ def train(args):
         device=device,
         policy_lr=args.lr,
         critic_lr=args.critic_lr,
+        # [FIX ORACLE TAKEOFF] init non nulle des canaux oracle + suivi
+        oracle_init=args.oracle_init,
+        oracle_scale=args.oracle_init_scale,
     )
 
     # --- Resume (optionnel) ---
@@ -551,6 +554,11 @@ def train(args):
 
             print(f"[train_rl]   -> step={start_step}, alpha={start_alpha:.4f}",
                   flush=True)
+            # [FIX ORACLE TAKEOFF] la reference ||W_o|| apres resume est
+            # celle des poids RECHARgES (pas celle de l'init kaiming).
+            agent.oracle_init_norm = agent.oracle_weight_norm()
+            print(f"[train_rl]   ||W_oracle|| (resume) = "
+                  f"{agent.oracle_init_norm:.4f}", flush=True)
         except Exception as e:
             print(f"[train_rl] ECHEC resume : {e}", flush=True)
 
@@ -855,6 +863,13 @@ def train(args):
                 elapsed = time.time() - t_start
                 metrics = compute_drift_metrics(batch)
                 alerts = check_drift_alerts(metrics, phase)
+                # [ORACLE MONITOR] norme des colonnes oracle de input_conv :
+                # reste collee a la valeur d'init = la policy n'utilise pas
+                # l'info cachee (cf. --oracle-init).
+                wo_now = agent.oracle_weight_norm()
+                wo_str = (f"{wo_now:.4f} "
+                          f"(init {agent.oracle_init_norm:.4f}, "
+                          f"{(wo_now / max(agent.oracle_init_norm, 1e-8) - 1.0) * 100:+.1f}%)")
                 rdev_str = (f"{ratio_dev_first:.3f}"
                             if ratio_dev_first is not None else "n/a")
                 kl_str = f"{kl_last:.4f}" if kl_last is not None else "off"
@@ -888,7 +903,8 @@ def train(args):
                         f"ret_mean={metrics['ret_mean']:+.2f} "
                         f"| top3=[{metrics['actions_top3']}] "
                         f"pgn={policy_gnorm.item():.2f} "
-                        f"cgn={critic_gnorm.item():.2f}",
+                        f"cgn={critic_gnorm.item():.2f} "
+                        f"||W_o||={wo_str}",
                         flush=True,
                     )
 
@@ -1055,6 +1071,19 @@ def main():
 
     p.add_argument('--oracle-frac', type=float, default=0.20)
     p.add_argument('--transition-frac', type=float, default=0.50)
+    p.add_argument('--oracle-init', choices=['zero', 'kaiming'],
+                   default='kaiming',
+                   help='[FIX ORACLE TAKEOFF] init des canaux oracle absents '
+                        'du checkpoint SL : zero (ancien, comportement '
+                        'initial == SL mais l oracle n influence pas les '
+                        'logits et doit croitre par pas PG bruites) ou '
+                        'kaiming (contribution immediate, le PG la renforce '
+                        'ou la corrige des le 1er update). Les canaux '
+                        'rouges restent a zero dans les deux cas.')
+    p.add_argument('--oracle-init-scale', type=float, default=0.25,
+                   help='echelle de l init kaiming des canaux oracle '
+                        '(0.25 : compromis mesure warm-start / vitesse de '
+                        'prise en charge de l oracle)')
     p.add_argument('--grp-checkpoint', type=str,
                    default='checkpoints/grp_sl_east4.pt')
 

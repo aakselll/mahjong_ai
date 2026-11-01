@@ -26,7 +26,8 @@ ORACLE_DIM = 4
 IN_CHANNELS_ORACLE = N_CHANNELS + ORACLE_DIM   # 283 (268 base + 11 rouges + 4 oracle)
 
 
-def adapt_in_channels(w, target_in, dim=1):
+def adapt_in_channels(w, target_in, dim=1, oracle_init='zero',
+                      oracle_scale=1.0):
     """Remet l'axe des canaux d'entree de `w` au layout de `target_in`.
 
     Layouts reconnus (ordre des blocs : base | rouges | oracle) :
@@ -34,6 +35,16 @@ def adapt_in_channels(w, target_in, dim=1):
         272 = base + oracle        283 = base + rouges + oracle
     Un bloc absent de la source est rempli de ZEROS (le modele se comporte
     alors exactement comme avant) ; un bloc absent de la cible est retire.
+    EXCEPTION : oracle_init='kaiming' initialise le bloc ORACLE absent en
+    Kaiming x oracle_scale (les rouges restent toujours a zero : le
+    comportement au chargement reste celui du checkpoint source pour la
+    partie visible, seule l'info cachee demarre active).
+    [FIX ORACLE TAKEOFF] Un bloc oracle a poids nuls reçoit bien un
+    gradient, mais sa contribution aux logits reste nulle jusqu'a ce que
+    les poids croissent par des pas PG bruités : a l'echelle du run
+    (phase oracle = ~50 updates), la specialisation oracle n'a pas le
+    temps d'emergre. Une init non nulle donne a l'oracle une contribution
+    immediate que le PG peut renforcer ou affaiblir des le 1er update.
     Une forme non reconnue est rendue telle quelle (le chargement echouera
     avec le message PyTorch habituel).
     """
@@ -50,7 +61,8 @@ def adapt_in_channels(w, target_in, dim=1):
     if cur not in layouts or target_in not in layouts:
         return w
     pieces, pos = [], 0
-    for size, has_src, has_dst in zip(sizes, layouts[cur], layouts[target_in]):
+    for block_i, (size, has_src, has_dst) in enumerate(
+            zip(sizes, layouts[cur], layouts[target_in])):
         piece = None
         if has_src:
             piece = w.narrow(dim, pos, size)
@@ -59,7 +71,14 @@ def adapt_in_channels(w, target_in, dim=1):
             if piece is None:
                 shape = list(w.shape)
                 shape[dim] = size
-                piece = w.new_zeros(shape)
+                if block_i == 2 and oracle_init == 'kaiming':
+                    piece = torch.empty(shape, dtype=w.dtype,
+                                        device=w.device)
+                    torch.nn.init.kaiming_normal_(piece,
+                                                  nonlinearity='relu')
+                    piece = piece * oracle_scale
+                else:
+                    piece = w.new_zeros(shape)
             pieces.append(piece)
     return torch.cat(pieces, dim=dim).contiguous()
 

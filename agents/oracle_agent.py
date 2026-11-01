@@ -53,7 +53,8 @@ class OracleDiscardAgent:
       depuis un SL a 12 blocs -- les blocs 12-15 restent aleatoires.
     """
     def __init__(self, sl_discard_path, sl_frozen_dir, device='cpu',
-                 policy_lr=1e-4, critic_lr=1e-3):
+                 policy_lr=1e-4, critic_lr=1e-3,
+                 oracle_init='kaiming', oracle_scale=0.25):
         self.device = device
 
         # --- Policy : archi lue depuis le checkpoint SL discard ---
@@ -66,10 +67,18 @@ class OracleDiscardAgent:
         self.policy = build_model('discard', use_oracle=True,
                                   channels=channels,
                                   n_blocks=n_blocks).to(device)
-        self._load_partial_sl(ck['model_state_dict'])
+        self._load_partial_sl(ck['model_state_dict'],
+                              oracle_init=oracle_init,
+                              oracle_scale=oracle_scale)
+        # [FIX ORACLE TAKEOFF] norme de reference des colonnes oracle pour
+        # monitorer la croissance (log du trainer).
+        with torch.no_grad():
+            self.oracle_init_norm = self.oracle_weight_norm()
         print(f"[oracle_agent] discard SL charge "
               f"(val_acc={ck.get('val_acc','?')}, "
-              f"arch={channels}x{n_blocks})", flush=True)
+              f"arch={channels}x{n_blocks}, "
+              f"oracle_init={oracle_init}x{oracle_scale} "
+              f"||W_o||={self.oracle_init_norm:.4f})", flush=True)
 
         # [ANCRE KL] Copie GELEE de la policy SL de depart. Sert de
         # reference pour la penalite KL(pi || pi_SL) : sans ancrage le
@@ -138,10 +147,25 @@ class OracleDiscardAgent:
         self.policy.eval()
         self.critic.eval()
 
-    def _load_partial_sl(self, state_dict):
+    def oracle_weight_norm(self):
+        """Norme L2 des poids input_conv des ORACLE_DIM canaux oracle.
+        Indicateur d'usage de l'info cachee : reste a la valeur d'init si
+        la policy n'apprend pas a s'en servir."""
+        w = self.policy.trunk.input_conv.weight
+        return float(w[:, N_CHANNELS:, :, :].norm().item())
+
+    def _load_partial_sl(self, state_dict, oracle_init='kaiming',
+                         oracle_scale=0.25):
         """Charge partiellement : le trunk (conv_in) attend 386 canaux mais
         le SL en a 250. On étend les poids d'entrée en initialisant les
         canaux oracle à 0.
+
+        [FIX ORACLE TAKEOFF] les canaux oracle sont initialises en Kaiming
+        x oracle_scale (defaut 0.25) au lieu de zero : a poids nuls
+        l'oracle n'influence pas les logits et doit croitre par pas PG
+        bruites -- trop lent a l'echelle du run (cf. oracle_weight_norm).
+        Les canaux ROUGES restent a zero (comportement initial == SL sur
+        la partie visible).
         """
         my_state = self.policy.state_dict()
         for k, v in state_dict.items():
@@ -151,10 +175,14 @@ class OracleDiscardAgent:
                 my_state[k].copy_(v)
             elif k == 'trunk.input_conv.weight':
                 # [ROUGES] (256, 283, 3, 1) attendu ; le SL a 268 (ancien)
-                # ou 279 (avec rouges) canaux : blocs absents = zeros.
-                new_w = adapt_in_channels(v, my_state[k].shape[1])
+                # ou 279 (avec rouges) canaux : blocs absents = zeros,
+                # SAUF oracle (kaiming x scale, cf. [FIX ORACLE TAKEOFF]).
+                new_w = adapt_in_channels(v, my_state[k].shape[1],
+                                          oracle_init=oracle_init,
+                                          oracle_scale=oracle_scale)
                 my_state[k].copy_(new_w)
-                print(f"[oracle_agent] {k} etendu de {v.shape} a {new_w.shape}")
+                print(f"[oracle_agent] {k} etendu de {v.shape} a {new_w.shape} "
+                      f"(oracle_init={oracle_init}x{oracle_scale})")
             # Les autres mismatch sont ignores (rare)
         self.policy.load_state_dict(my_state)
 
