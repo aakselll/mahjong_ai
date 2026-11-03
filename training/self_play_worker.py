@@ -40,7 +40,8 @@ def worker_loop(worker_id, state, lock, transitions_queue,
                 sl_discard_path, sl_frozen_dir,
                 grp_path=None,
                 n_games_per_cycle=10, device='cpu',
-                opponent_sl=False, opponent_mode='argmax'):
+                opponent_sl=False, opponent_mode='argmax',
+                danger_penalty=0.0):
     """
     [NIVEAU 2] Les transitions passent par une mp.Queue au lieu d'une
     liste proxy Manager.
@@ -58,6 +59,12 @@ def worker_loop(worker_id, state, lock, transitions_queue,
         opponent_sl        : True -> 1 siege RL (tire au hasard par partie)
                              + 3 sieges SL figes ; False -> self-play
         opponent_mode      : 'argmax' | 'sample' pour les SL adversaires
+        danger_penalty     : > 0 -> penalite sur chaque decision du siege
+                             RL qui defausse une tuile 'dangereuse'
+                             (ron immediat pour un adversaire tenpai,
+                             calcule depuis les mains cachees). En
+                             phase 1 l'oracle rend ce label LISIBLE ->
+                             la policy apprend a s'en servir.
     """
     # [FIX] Limite les threads PyTorch par worker pour eviter
     # l'oversubscription.
@@ -95,8 +102,11 @@ def worker_loop(worker_id, state, lock, transitions_queue,
                   game_log_buffer=None, n_rounds=4,
                   game_format="tonpuu")
     env.round_env.frozen_sl = agent.frozen_sl
+    # [DANGER] labels de danger dans les requetes DISCARD si penalite
+    env.round_env.compute_danger = bool(danger_penalty > 0)
     print(f"[worker {worker_id}] demarre (n_rounds=4, "
-          f"opponent_sl={opponent_sl})", flush=True)
+          f"opponent_sl={opponent_sl}, danger_penalty={danger_penalty})",
+          flush=True)
     seat_rng = np.random.RandomState(1000 + worker_id)
 
     while True:
@@ -118,7 +128,8 @@ def worker_loop(worker_id, state, lock, transitions_queue,
             agent_player = int(seat_rng.randint(4)) if opponent_sl else None
             transitions, game_stats = _play_one_game(
                 env, agent, gamma_t, agent_player=agent_player,
-                opponent_argmax=(opponent_mode == 'argmax'))
+                opponent_argmax=(opponent_mode == 'argmax'),
+                danger_penalty=danger_penalty)
             if transitions:
                 # [NIVEAU 2] put au lieu de buffer_add.
                 # timeout : ne pas bloquer indefiniment si le trainer est
@@ -188,11 +199,56 @@ def _update_stats(stats_proxy, lock, game_stats):
         # non gerees (doivent rester a 0 : sinon une tete SL figee est
         # cassee).
         for k in ('n_riichi', 'n_pon', 'n_chi', 'n_kan', 'n_ron_refused',
-                  'n_sl_errors', 'n_unhandled'):
+                  'n_sl_errors', 'n_unhandled', 'n_rl_discards',
+                  'n_danger_discards'):
             stats_proxy[k] = stats_proxy.get(k, 0) + game_stats.get(k, 0)
 
+def _finalize_episode_returns(transitions, rho=0.85):
+    """[V9 CRITIC] Retour restant de partie par decision : G_t = somme
+    escomptee (rho^(j-r)) des rewards des manches FUTURES du siege.
+
+    Pourquoi : la cible du critic v8 etait le delta GRP de la MANCHE
+    courante -- une return Monte Carlo determinee par l'issue de la
+    manche (le futur). Probe sur le checkpoint 200k : EV=0.0000,
+    val_std=0.0001, ridge R2=-0.87, critic frais R2_frais=-1.28 ->
+    E[R|s] est plat, le critic degenerait en constante. Le RETOUR
+    RESTANT de partie, lui, est previsible depuis l'etat (own/opp
+    scores en buckets, manche, honba + oracle sont dans les 283
+    canaux ; le GRP lui-meme le prouve sur 12 features grossieres).
+    A = G_t - V(s_t) reste sans biais (V ne depend que de s).
+
+    Groupe les transitions par (siege, manche) consecutives ; R_g =
+    reward de la DERNIERE transition du groupe (le backfill touche tout
+    le groupe a l'identique). Les corrections (carried/pending, qui
+    n'affectent que la 1re/derniere transition) sont restaurees par
+    le terme (t['reward'] - R_g) : chaque transition garde exactement
+    les rewards qui lui ont ete attribues.
+    """
+    groups = {}
+    order = []
+    for i, t in enumerate(transitions):
+        key = (t['seat'], t.get('round', 0))
+        if key not in groups:
+            order.append(key)
+            groups[key] = []
+        groups[key].append(i)
+    suffix = {s: 0.0 for s in set(t['seat'] for t in transitions)}
+    G = {}
+    for key in reversed(order):
+        seat = key[0]
+        idxs = groups[key]
+        R_g = transitions[idxs[-1]]['reward']
+        suffix[seat] = R_g + rho * suffix[seat]
+        for i in idxs:
+            G[i] = suffix[seat] + (transitions[i]['reward'] - R_g)
+    for i, t in enumerate(transitions):
+        t['return'] = float(G[i])
+    return transitions
+
+
 def _play_one_game(env, agent, gamma_t, agent_player=None,
-                   opponent_argmax=True):
+                   opponent_argmax=True, return_rho=0.85,
+                   danger_penalty=0.0):
     """Joue une partie COMPLETE (4 rounds + repeats).
 
     [FIX MULTI-SEAT REWARD] Le reward de la manche k est attribue a
@@ -202,6 +258,17 @@ def _play_one_game(env, agent, gamma_t, agent_player=None,
     transitions avaient reward=0, diluant le signal d'apprentissage par
     ~50x.
 
+    [V9 CRITIC] Chaque transition porte en plus 'round' (index de
+    manche) et, en fin de partie, 'return' = G_t (retour restant
+    escompte, cible du critic -- voir _finalize_episode_returns).
+
+    [DANGER] si danger_penalty > 0, chaque decision du siege RL qui
+    defausse une tuile dangereuse (ron immediat pour un tenpai) prend
+    la penalite sur SA reward -- et uniquement elle : dans
+    _finalize_episode_returns, le terme de correction (reward_i - R_g)
+    garde la penalite sur la transition coupable et l'annule pour les
+    autres transitions de la manche (credit par-decision exact).
+
     [ADVERSAIRES SL] agent_player=None : self-play (4 sieges RL).
     agent_player=k : seul le joueur k joue avec la policy RL et produit des
     transitions ; les 3 autres jouent la policy SL figee (sans transition).
@@ -210,6 +277,8 @@ def _play_one_game(env, agent, gamma_t, agent_player=None,
     pending_reward = {s: 0.0 for s in range(4)}
     # [FIX] Tous les indices par siege pour la manche courante
     round_indices_per_seat = {s: [] for s in range(4)}
+    # [V9] Index de manche pose sur chaque transition (pour G_t)
+    round_counter = 0
     max_honba = 0
 
     stats = {
@@ -219,6 +288,8 @@ def _play_one_game(env, agent, gamma_t, agent_player=None,
         'n_exhaustive': 0,
         'n_abortive': 0,
         'n_unhandled': 0,
+        'n_rl_discards': 0,
+        'n_danger_discards': 0,
     }
     # [STATS] snapshot des compteurs cumules de l'env (par process) pour
     # en deduire les deltas de CETTE partie : riichi, appels, ron refuses.
@@ -231,6 +302,7 @@ def _play_one_game(env, agent, gamma_t, agent_player=None,
         env_action = None
         logp = value = 0.0
         obs_n = obs_o = mask = None
+        danger = None
 
         if req['action_type'] == DISCARD and agent_player is not None \
                 and seat != agent_player:
@@ -241,6 +313,7 @@ def _play_one_game(env, agent, gamma_t, agent_player=None,
             obs_n = req['obs']
             obs_o = req['oracle']
             mask = req['mask']
+            danger = req.get('danger')
             action, logp, value, masked_obs_o = agent.select_action(
                 obs_n, obs_o, mask, gamma_t)
             env_action = action
@@ -261,6 +334,14 @@ def _play_one_game(env, agent, gamma_t, agent_player=None,
             # sa prochaine transition plutot que le perdre.
             carried_reward = pending_reward[seat]
             pending_reward[seat] = 0.0
+            # [DANGER] penalite par-decision : tuile qui ferait ron.
+            # Entre dans t['reward'] AVANT le backfill du delta de la
+            # manche -> le credit est exact (voir docstring).
+            if danger is not None:
+                stats['n_rl_discards'] += 1
+                if float(danger[action]) > 0:
+                    stats['n_danger_discards'] += 1
+                    carried_reward -= danger_penalty
             transitions.append({
                 'seat': seat,
                 # [FIX MEMOIRE] float16 : ~18 Ko au lieu de ~36 Ko par coup.
@@ -277,6 +358,7 @@ def _play_one_game(env, agent, gamma_t, agent_player=None,
                 'logp': logp,
                 'value': value,
                 'reward': carried_reward,
+                'round': round_counter,
                 'done': False,
             })
             # [FIX] Enregistrer TOUTES les transitions du siege
@@ -293,6 +375,9 @@ def _play_one_game(env, agent, gamma_t, agent_player=None,
             elif outcome.startswith('abortive'):
                 stats['n_abortive'] += 1
             stats['n_rounds'] += 1
+            # [V9] La manche est terminee : les transitions suivantes
+            # appartiennent a la manche suivante.
+            round_counter += 1
 
             max_honba = max(max_honba, env.honba)
 
@@ -330,6 +415,8 @@ def _play_one_game(env, agent, gamma_t, agent_player=None,
 
     if transitions:
         transitions[-1]['done'] = True
+        # [V9 CRITIC] Retour restant de partie (cible du critic)
+        _finalize_episode_returns(transitions, rho=return_rho)
 
     scores = env.game_scores
     order = sorted(range(4), key=lambda p: (-scores[p], p))

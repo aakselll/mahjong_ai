@@ -87,6 +87,8 @@ STATS_KEYS_INIT = {
     'n_ron_refused': 0,
     'n_sl_errors': 0,       # doit rester 0 (tete SL figee en erreur)
     'n_unhandled': 0,       # doit rester 0 (requete non-DISCARD inattendue)
+    'n_rl_discards': 0,     # [DANGER] decisions du siege RL (si penalite)
+    'n_danger_discards': 0,  # [DANGER] ... dont la tuile ferait ron
 }
 
 
@@ -147,6 +149,13 @@ def format_game_stats(stats_proxy):
         f"calls/rnd={calls_rnd:.2f} "
         f"ron_refus/rnd={refused_rnd:.2f}"
     )
+    n_rl = stats_proxy.get('n_rl_discards', 0)
+    if n_rl:
+        # [DANGER] % de defausses du siege RL qui feraient ron (tenpai
+        # adverse, mains cachees). En phase 1 (oracle complet), la policy
+        # peut lire le danger -> ce % doit CHUTER = preuve d'exploitation
+        # de l'oracle. Reference SL : le niveau de la ligne de depart.
+        line += (f" dng%={100 * stats_proxy.get('n_danger_discards', 0) / n_rl:.2f}")
     n_err = stats_proxy.get('n_sl_errors', 0)
     n_unh = stats_proxy.get('n_unhandled', 0)
     if n_err or n_unh:
@@ -317,22 +326,33 @@ def compute_advantages(transitions, gamma=0.99, lam=0.95, agent=None,
     adv_mode='batch_mean' (ancien comportement, papier Suphx) :
         A = R - mean(R_batch)
     adv_mode='critic' :
-        A = R - V(s), V = critic asymetrique (voit l'oracle complet),
-        entraine a predire la reward de la manche (R / reward_scale).
-        R est la reward GRP de la manche, identique pour toutes les
-        decisions du siege dans la manche ; avec gamma=1 et fin de manche
-        terminale, le GAE(lambda=1) se reduit exactement a R - V(s_t) :
-        c'est la forme sans biais, immunisee contre l'interleaving des
-        sieges (aucun bootstrap entre transitions).
+        [V9] A = G_t - V(s_t). G_t = retour RESTANT de partie (somme
+        escomptee des rewards des manches futures, cf.
+        _finalize_episode_returns), pose par le worker sur chaque
+        transition. V = critic asymetrique (voit l'oracle complet),
+        entraine a predire G_t / reward_scale.
+
+        Pourquoi le changement de cible : le delta GRP de la MANCHE
+        (cible v8) est determine par l'issue de la manche (le futur)
+        -> E[R|s] plat (probe 200k : EV=0.0000, val_std=0.0001) ->
+        le critic degenerait en constante, aucune reduction de
+        variance. G_t est previsible depuis l'etat (own/opp scores en
+        buckets, manche, honba + oracle sont dans les 283 canaux) ->
+        le critic reduit VRAIMENT la variance, surtout en fin de
+        partie ou le placement se joue. A = G_t - V(s_t) reste sans
+        biais : V ne depend que de s.
 
     Positionne compute_advantages.last_ev / .last_used_critic (logs).
     """
-    rewards = np.array([t['reward'] for t in transitions], dtype=np.float32)
+    # [V9] Cible du critic / avantage : retour restant G_t (repli :
+    # reward de manche pour les episodes d'avant le patch)
+    returns = np.array([t.get('return', t['reward']) for t in transitions],
+                       dtype=np.float32)
 
     values = None
     if adv_mode == 'critic' and agent is not None:
         values = _critic_values(agent, transitions, reward_scale)
-    advs, ev, used = advantages_from_values(rewards, values, min_ev)
+    advs, ev, used = advantages_from_values(returns, values, min_ev)
     compute_advantages.last_ev = ev
     compute_advantages.last_used_critic = used
 
@@ -342,7 +362,7 @@ def compute_advantages(transitions, gamma=0.99, lam=0.95, agent=None,
 
     for i, tr in enumerate(transitions):
         tr['advantage'] = advs[i]
-        tr['return'] = tr['reward']
+        tr['return'] = returns[i]
 
     return advs
 
@@ -399,7 +419,8 @@ def pg_is_loss(agent, transitions, advantages, gamma_t,
         policy_loss = -(ratio * advs * keep).mean()
 
     if critic_mode:
-        # cible en unites normalisees (R / reward_scale) : stabilise le MLP
+        # cible en unites normalisees (G_t / reward_scale) : le critic
+        # predit le retour restant de partie, pas le delta de manche
         value_loss = ((values - returns / reward_scale) ** 2 * keep).mean()
     else:
         value_loss = ((values - returns) ** 2 * keep).mean()
@@ -410,7 +431,30 @@ def pg_is_loss(agent, transitions, advantages, gamma_t,
 # ---------------------------------------------------------------------- #
 # Boucle principale
 # ---------------------------------------------------------------------- #
+def apply_phase1_guards(args):
+    """[PHASE 1 GUARD] protege un run oracle-complet de l'erreur v10/v11.
+
+    ref_policy (l'ancre KL) est une copie du SL de depart : ses canaux
+    oracle sont ceux de --oracle-init (zero = totalement aveugle). En
+    phase 1 (--oracle-frac 1.0) la policy DOIT s'ecarter du SL
+    precisement la ou l'oracle revele un danger que le SL ne voit pas ->
+    toute valeur kl_coef > 0 punit cet ecart et referme le pathway par
+    les gradients (v10 : ||W_o|| 4.0 -> 0.18 avec kl=0.05 ; v11 lance
+    avec 0.10, soit 2x plus vite encore). On force kl_coef=0, sauf
+    opt-out explicite --allow-phase1-kl.
+    """
+    if (args.oracle_frac >= 1.0 and args.kl_coef > 0
+            and not getattr(args, 'allow_phase1_kl', False)):
+        print(f"[GUARD PHASE 1] --oracle-frac {args.oracle_frac:.2f} avec "
+              f"--kl-coef {args.kl_coef} : l'ancre KL est le SL de depart, "
+              f"aveugle a l'oracle -> effondrement ||W_o|| assure (cf. v10 "
+              f"4.0 -> 0.18). kl_coef force a 0.0 (--allow-phase1-kl pour "
+              f"conserver la valeur).", flush=True)
+        args.kl_coef = 0.0
+
+
 def train(args):
+    apply_phase1_guards(args)   # [PHASE 1 GUARD] avant tout le reste
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     if device == 'cuda':
         print(f"[train_rl] GPU detected : {torch.cuda.get_device_name(0)}")
@@ -554,6 +598,14 @@ def train(args):
 
             print(f"[train_rl]   -> step={start_step}, alpha={start_alpha:.4f}",
                   flush=True)
+            # [PHASES] enchainer les phases proprement : un milestone de
+            # fin de phase 1 porte un step eleve qui fausserait le
+            # schedule gamma/lr de la phase suivante (gamma deja parti a
+            # 0.x). --reset-step garde les poids, repart a step=0.
+            if args.reset_step:
+                print(f"[train_rl]   --reset-step : step {start_step} -> 0 "
+                      f"(schedule de phase repart du debut)", flush=True)
+                start_step = 0
             # [FIX ORACLE TAKEOFF] la reference ||W_o|| apres resume est
             # celle des poids RECHARgES (pas celle de l'init kaiming).
             agent.oracle_init_norm = agent.oracle_weight_norm()
@@ -561,6 +613,16 @@ def train(args):
                   f"{agent.oracle_init_norm:.4f}", flush=True)
         except Exception as e:
             print(f"[train_rl] ECHEC resume : {e}", flush=True)
+
+    # [ANCRE KL phase 2/3] --kl-ref : charge la reference KL depuis un
+    # checkpoint (la policy de phase 1, oracle-aware) au lieu du SL de
+    # depart, aveugle a l'oracle. Inutilise en phase 1 (kl_coef=0) mais
+    # decisif en phase 2/3 : sans lui, la penalite KL re-importe la
+    # pression anti-oracle du SL qui a fait chuter ||W_o|| en v10.
+    if args.kl_ref:
+        ref_ck = torch.load(args.kl_ref, map_location=device,
+                            weights_only=False)
+        agent.load_kl_ref(ref_ck['policy'])
 
     # [FIX BATCHNORM] Policy en eval : stats BN du SL figees, identiques
     # entre rollout (batch 1) et update (batch ~1000).
@@ -572,6 +634,16 @@ def train(args):
               "contient des running stats BN polluees par le mode train. "
               "Repartir du SL (sans --resume) pour un test propre.",
               flush=True)
+
+    # [SANITY t=0] banniere de controle : tout ce qui doit etre vrai au
+    # demarrage d'un run de phase 1 (oracle complet) depuis le warmup.
+    print(f"[SANITY t=0] oracle_frac={args.oracle_frac:.2f} "
+          f"transition_frac={args.transition_frac:.2f} "
+          f"kl_coef={args.kl_coef} alpha={start_alpha:.4f} "
+          f"alpha_max={args.alpha_max} h_target={args.h_target}", flush=True)
+    print(f"[SANITY t=0] ||W_o||={agent.oracle_init_norm:.4f} "
+          f"(attendu : warmup ~13.57, SL+kaimingx0.25 ~4.0, zero ~0.0) "
+          f"resume={args.resume} kl_ref={args.kl_ref}", flush=True)
 
     # --- Publish initial ---
     publish_to_state(
@@ -595,6 +667,7 @@ def train(args):
                 args.grp_checkpoint,
                 args.games_per_cycle, device,
                 args.opponent_sl, args.opponent_mode,
+                args.danger_penalty,
             ),
             daemon=True,
         )
@@ -746,6 +819,42 @@ def train(args):
                 adv_mode=('critic' if critic_mode and not warm
                           else 'batch_mean'),
                 reward_scale=args.reward_scale, min_ev=args.min_ev)
+
+            # [FIX CRITIC BUDGET] Le compteur de steps compte des
+            # TRANSITIONS consommees, pas des mises a jour : 2000 steps
+            # = 2 updates x 3 epochs = 6 pas de gradient au total. V8
+            # n'a donne que ~800 pas de gradient au critic en 228k
+            # steps (dont ~300 pendant tout le warmup 50k) : budget
+            # ~100x trop petit pour apprendre V(s) (val_std ~ 0,
+            # FLAT_VALUE permanent). Inner loop : K pas supplementaires
+            # par update, en minibatch aleatoire pour limiter l'overfit
+            # des ~60-100 cibles distinctes du batch. Les avantages ont
+            # deja ete calcules ci-dessus : cette boucle n'affecte pas
+            # la policy, elle enrichit seulement le critic.
+            if critic_mode and args.critic_inner_steps > 0:
+                on_all = torch.as_tensor(
+                    np.stack([t['obs_normal'] for t in batch]),
+                    dtype=torch.float32, device=agent.device)
+                oo_all = torch.as_tensor(
+                    np.stack([t.get('obs_oracle_full', t['obs_oracle'])
+                              for t in batch]),
+                    dtype=torch.float32, device=agent.device)
+                ret_all = torch.as_tensor(
+                    [t['return'] for t in batch],
+                    dtype=torch.float32, device=agent.device
+                ) / args.reward_scale
+                mb = min(256, len(batch))
+                for _ in range(args.critic_inner_steps):
+                    sel = torch.randint(0, len(batch), (mb,),
+                                        device=agent.device)
+                    agent.critic_optim.zero_grad()
+                    v = agent.critic(
+                        torch.cat([on_all[sel], oo_all[sel]], dim=1))
+                    vloss = ((v - ret_all[sel]) ** 2).mean()
+                    vloss.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        agent.critic.parameters(), 5.0)
+                    agent.critic_optim.step()
 
             # Multi-epoch PPO : plusieurs passes de gradient par batch
             PPO_EPOCHS = args.ppo_epochs
@@ -1026,11 +1135,28 @@ def main():
     p.add_argument('--max-batch-transitions', type=int, default=1000)
 
     p.add_argument('--lr', type=float, default=1e-4)
-    p.add_argument('--critic-lr', type=float, default=3e-3)
+    # [FIX CRITIC BUDGET] 3e-3 rendait l'Adam du critic instable : il
+    # trouvait un bon V(s) puis divergeait et le perdait (signature v8 :
+    # EV +0.012 -> 0.000 en oscillation, val_std 0.13 -> 0.00).
+    # Stable a 1e-3 (verifie sur cible synthetique).
+    p.add_argument('--critic-lr', type=float, default=1e-3)
+    # [FIX CRITIC BUDGET] pas de gradient SUPPLEMENTAIRES du critic par
+    # update (minibatch aleatoire de 256). Sans inner loop, le compteur
+    # de steps donne seulement 6 pas de gradient par 2000 steps (2
+    # updates x 3 epochs) : ~800 pas en tout dans v8. 10 -> 13 pas par
+    # update (26 par 2000 steps), ~3300 sur 250k steps. 0 desactive.
+    p.add_argument('--critic-inner-steps', type=int, default=10)
     p.add_argument('--gamma', type=float, default=0.99)
     p.add_argument('--lam', type=float, default=0.95)
     p.add_argument('--clip-eps', type=float, default=0.2)
     p.add_argument('--value-coef', type=float, default=0.5)
+    p.add_argument('--danger-penalty', type=float, default=0.0,
+                   help="[DANGER] penalite sur la reward d'une decision qui "
+                        "defausse une tuile qui ferait ron a un adversaire "
+                        "tenpai (calcule depuis les mains cachees, sans "
+                        "toucher au reseau). 0 = desactive. Conseille 0.5-1.0."
+                        " Credit par-decision exact ; en phase 1 l'oracle "
+                        "rend le danger lisible -> KPI dng%% dans les logs.")
     p.add_argument('--adv-mode', choices=['batch_mean', 'critic'],
                    default='batch_mean',
                    help="avantage : 'batch_mean' (A = R - moyenne du batch, "
@@ -1092,7 +1218,19 @@ def main():
     p.add_argument('--kl-coef', type=float, default=0.05,
                    help='[ANCRE] poids de KL(pi || pi_SL) dans la loss. '
                         '0 = desactive. Plage utile 0.02-0.2 : trop bas -> '
-                        'derive passive ; trop haut -> reste colle au SL.')
+                        'derive passive ; trop haut -> reste colle au SL. '
+                        '[PHASE 1 GUARD] force a 0 si --oracle-frac >= 1.0 '
+                        '(cf. apply_phase1_guards).')
+    p.add_argument('--allow-phase1-kl', action='store_true',
+                   help='[PHASE 1 GUARD] conserver --kl-coef tel quel meme '
+                        'si --oracle-frac >= 1.0 (deconseille : ancre SL '
+                        'aveugle a l oracle -> effondrement ||W_o||, cf. v10)')
+    p.add_argument('--kl-ref', type=str, default=None,
+                   help='[ANCRE] checkpoint dont les poids chargent la '
+                        'reference KL (defaut : SL de depart, aveugle a '
+                        'l oracle). Phase 2/3 : pointer le meilleur '
+                        'checkpoint de phase 1 pour ancrer une policy '
+                        'oracle-AWARE.')
     p.add_argument('--opponent-sl', action='store_true',
                    help='[ADVERSAIRES SL] 1 siege = policy RL (entrainee), '
                         '3 sieges = policy SL figee. Le siege RL est tire '
@@ -1119,7 +1257,14 @@ def main():
 
     p.add_argument('--alpha-resume', type=float, default=None,
                    help='alpha au resume ; prioritaire sur le checkpoint '
-                        '(defaut: alpha du checkpoint, sinon --alpha-init)')
+                        '(defaut: alpha du checkpoint, sinon --alpha-init). '
+                        'OBLIGATOIRE pour ecraser l alpha du checkpoint '
+                        'warmup (0.0022) : --alpha-resume 0.05.')
+    p.add_argument('--reset-step', action='store_true',
+                   help='[PHASES] reprend les POIDS du --resume mais repart '
+                        'a step=0 : un milestone de fin de phase 1 porte un '
+                        'step eleve qui fausserait le schedule gamma/lr de '
+                        'la phase suivante.')
 
     args = p.parse_args()
     train(args)
