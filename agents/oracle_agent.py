@@ -133,6 +133,10 @@ class OracleDiscardAgent:
             _p.requires_grad = False
         self.compute_kl = False       # active par la boucle (--kl-coef > 0)
         self.last_kl = None
+        # [DANGER LOSS] E_pi[danger] (B,) avec gradient, et KL d'ablation
+        # oracle (diagnostic : 0 = la policy ignore l'oracle)
+        self.last_p_danger = None
+        self.last_abl_kl = None
 
         # --- Critic ---
         self.critic = Critic().to(device)
@@ -202,7 +206,7 @@ class OracleDiscardAgent:
         self.ref_policy.eval()
         with torch.no_grad():
             wo = self.ref_policy.trunk.input_conv.weight[
-                :, N_CHANNELS:, :, :].norm().item()
+                :, -ORACLE_DIM:, :, :].norm().item()
         print(f"[oracle_agent] ancre KL rechargee : ||W_o||_ref={wo:.4f} "
               f"(0.0 = ancre aveugle a l'oracle)", flush=True)
 
@@ -211,7 +215,9 @@ class OracleDiscardAgent:
         Indicateur d'usage de l'info cachee : reste a la valeur d'init si
         la policy n'apprend pas a s'en servir."""
         w = self.policy.trunk.input_conv.weight
-        return float(w[:, N_CHANNELS:, :, :].norm().item())
+        # [FIX] derniers ORACLE_DIM canaux seulement : N_CHANNELS: incluait
+        # aussi les canaux ROUGES (init a zero) dans la norme.
+        return float(w[:, -ORACLE_DIM:, :, :].norm().item())
 
     def _load_partial_sl(self, state_dict, oracle_init='kaiming',
                          oracle_scale=0.25):
@@ -340,7 +346,7 @@ class OracleDiscardAgent:
 
     # ------------------------------------------------------------------ #
     def evaluate_actions(self, obs_n, obs_o, masks, actions, gamma_t,
-                         obs_o_full=None):
+                         obs_o_full=None, danger=None, ablate=False):
         """Evalue les log-probs des actions sous la policy courante.
         
         [FIX ORACLE GUIDING] obs_o est DEJA MASQUE (stocke depuis la
@@ -377,6 +383,27 @@ class OracleDiscardAgent:
         log_probs = torch.log_softmax(masked_logits, dim=-1)
         probs = torch.exp(log_probs)
         entropy = -(probs * log_probs).sum(dim=-1)
+
+        # [DANGER LOSS] E_pi[danger(t)] : probabilite que la policy defausse
+        # une tuile qui ferait ron. Esperance EXACTE (pas d'echantillonnage),
+        # gradient direct vers les logits -> seule une policy qui LIT
+        # l'oracle (mains adverses) peut la reduire sans perdre ailleurs.
+        self.last_p_danger = None
+        if danger is not None:
+            d = torch.as_tensor(danger, dtype=torch.float32,
+                                device=self.device)
+            self.last_p_danger = (probs * d).sum(dim=-1)
+
+        # [DIAG ABLATION] KL(pi_oracle || pi_oracle=0) sur ce batch.
+        # ~0 => la policy n'utilise pas l'oracle.
+        if ablate:
+            with torch.no_grad():
+                x0 = torch.cat([on, torch.zeros_like(oo)], dim=1)
+                lg0 = self.policy(x0) + (mask_t - 1.0) * 1e9
+                lp0 = torch.log_softmax(lg0, dim=-1)
+                self.last_abl_kl = float(
+                    (probs.detach() * (log_probs.detach() - lp0))
+                    .sum(dim=-1).mean().item())
 
         # [ANCRE KL] KL(pi || pi_SL) moyenne sur les etats du batch, avec
         # gradient vers pi. Stockee dans self.last_kl (la signature de

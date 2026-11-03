@@ -375,7 +375,8 @@ compute_advantages.last_used_critic = False
 # ---------------------------------------------------------------------- #
 def pg_is_loss(agent, transitions, advantages, gamma_t,
                 clip_eps=0.2, iw_threshold=None, phase=1,
-                critic_mode=False, reward_scale=10.0):
+                critic_mode=False, reward_scale=10.0,
+                danger_coef=0.0, ablate=False):
     obs_n = torch.as_tensor(np.stack([t['obs_normal'] for t in transitions]),
                              dtype=torch.float32, device=agent.device)
     obs_o = torch.as_tensor(np.stack([t['obs_oracle'] for t in transitions]),
@@ -394,8 +395,13 @@ def pg_is_loss(agent, transitions, advantages, gamma_t,
     if critic_mode:
         oof = np.stack([t.get('obs_oracle_full', t['obs_oracle'])
                         for t in transitions])
+    dng = None
+    if danger_coef > 0 and all(t.get('danger') is not None
+                               for t in transitions):
+        dng = np.stack([t['danger'] for t in transitions]).astype(np.float32)
     new_logp, values, entropy = agent.evaluate_actions(
-        obs_n, obs_o, masks, actions, gamma_t, obs_o_full=oof)
+        obs_n, obs_o, masks, actions, gamma_t, obs_o_full=oof,
+        danger=dng, ablate=ablate)
     ratio = torch.exp(new_logp - old_logp)
     # [DIAG] ecart moyen du ratio a 1 (lu par la boucle a l'epoch 0).
     # NB : non nul meme sans bug, car le buffer est un replay et les
@@ -867,6 +873,7 @@ def train(args):
             entropy_first = None
             ratio_dev_first = None
             kl_last = None
+            pdanger_last = None
             for epoch_i in range(PPO_EPOCHS):
                 agent.policy_optim.zero_grad()
                 agent.critic_optim.zero_grad()
@@ -874,7 +881,10 @@ def train(args):
                 policy_loss, value_loss, entropy = pg_is_loss(
                     agent, batch, advantages, gamma_t,
                     clip_eps=args.clip_eps, iw_threshold=iw_thresh, phase=phase,
-                    critic_mode=critic_mode, reward_scale=args.reward_scale)
+                    critic_mode=critic_mode, reward_scale=args.reward_scale,
+                    danger_coef=args.danger_loss_coef,
+                    ablate=(epoch_i == 0 and args.ablate_every > 0
+                            and n_updates % args.ablate_every == 0))
                 if policy_loss is None:
                     break
                 if epoch_i == 0:
@@ -891,6 +901,12 @@ def train(args):
                 if (not warm) and args.kl_coef > 0 and kl_t is not None:
                     loss = loss + args.kl_coef * kl_t
                     kl_last = float(kl_t.detach().item())
+                # [DANGER LOSS] penalite analytique E_pi[danger]
+                pd_t = getattr(agent, 'last_p_danger', None)
+                if (not warm) and args.danger_loss_coef > 0 \
+                        and pd_t is not None:
+                    loss = loss + args.danger_loss_coef * pd_t.mean()
+                    pdanger_last = float(pd_t.detach().mean().item())
                 loss.backward()
                 policy_gnorm_last = torch.nn.utils.clip_grad_norm_(
                     agent.policy.parameters(), 5.0)
@@ -982,6 +998,10 @@ def train(args):
                 rdev_str = (f"{ratio_dev_first:.3f}"
                             if ratio_dev_first is not None else "n/a")
                 kl_str = f"{kl_last:.4f}" if kl_last is not None else "off"
+                pdng_str = (f"{pdanger_last:.4f}"
+                            if pdanger_last is not None else "n/a")
+                abl = getattr(agent, 'last_abl_kl', None)
+                abl_str = f"{abl:.5f}" if abl is not None else "n/a"
                 if critic_mode:
                     ev_str = (f"ev={compute_advantages.last_ev:+.3f}"
                               f"({'WARMUP' if warm else ('critic' if compute_advantages.last_used_critic else 'repli-mean')}) ")
@@ -995,6 +1015,7 @@ def train(args):
                       f"alpha={alpha:.4f} "
                       f"rdev={rdev_str} "
                       f"kl={kl_str} "
+                      f"pdng={pdng_str} ablKL={abl_str} "
                       f"{ev_str}"
                       f"gamma={gamma_t:.3f} "
                       f"buf={current_buf}{mem_info} "
@@ -1195,6 +1216,14 @@ def main():
                         'la policy loss. 0 = pas de cap (comportement '
                         'papier, deconseille a petite echelle).')
 
+    p.add_argument('--danger-loss-coef', type=float, default=0.0,
+                   help='[DANGER LOSS] poids de E_pi[danger] ajoute a la '
+                        'loss (esperance exacte de defausser une tuile qui '
+                        'fait ron, labels depuis les mains cachees). 0 = '
+                        'desactive. Conseille 0.3-1.0 en phase 1.')
+    p.add_argument('--ablate-every', type=int, default=10,
+                   help='[DIAG] tous les N updates, mesure KL(pi || pi avec '
+                        'oracle=0) -> "ablKL" dans les logs (0 = off).')
     p.add_argument('--oracle-frac', type=float, default=0.20)
     p.add_argument('--transition-frac', type=float, default=0.50)
     p.add_argument('--oracle-init', choices=['zero', 'kaiming'],
@@ -1267,6 +1296,9 @@ def main():
                         'la phase suivante.')
 
     args = p.parse_args()
+    if args.danger_loss_coef > 0:
+        # herite par les workers (spawn) : active les labels de danger
+        os.environ['MJ_DANGER_LABELS'] = '1'
     train(args)
 
 

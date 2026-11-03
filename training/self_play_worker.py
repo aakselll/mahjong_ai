@@ -103,7 +103,10 @@ def worker_loop(worker_id, state, lock, transitions_queue,
                   game_format="tonpuu")
     env.round_env.frozen_sl = agent.frozen_sl
     # [DANGER] labels de danger dans les requetes DISCARD si penalite
-    env.round_env.compute_danger = bool(danger_penalty > 0)
+    # [DANGER LOSS] MJ_DANGER_LABELS=1 (pose par train_rl si
+    # --danger-loss-coef > 0) active aussi les labels sans penalite.
+    env.round_env.compute_danger = bool(
+        danger_penalty > 0 or os.environ.get('MJ_DANGER_LABELS') == '1')
     print(f"[worker {worker_id}] demarre (n_rounds=4, "
           f"opponent_sl={opponent_sl}, danger_penalty={danger_penalty})",
           flush=True)
@@ -354,6 +357,9 @@ def _play_one_game(env, agent, gamma_t, agent_player=None,
                 # critic asymetrique / la baseline V(s).
                 'obs_oracle_full': np.asarray(obs_o, dtype=np.float32),
                 'mask': mask,
+                # [DANGER LOSS] label exact (34,) : 1 = ferait ron
+                'danger': (None if danger is None
+                           else np.asarray(danger, dtype=np.uint8)),
                 'action': action,
                 'logp': logp,
                 'value': value,
